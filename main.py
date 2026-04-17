@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+from datetime import datetime, timezone
 import logging
 import os
 import re
@@ -26,7 +28,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
-from panel_api import PanelAPI, PanelAPIError
+from panel_api import PanelAPI, PanelAPIError, subscription_expiry_time_ms
 from vpn_rules import RULES_TEXT
 from vpn_user_agreement import AGREEMENT_TEXT
 
@@ -66,6 +68,11 @@ DEVICE_LABEL_RU = {
     "pc": "ПК",
     "other": "Другое устройство",
 }
+
+REMINDER_3D_MS = 3 * 24 * 60 * 60 * 1000
+REMINDER_1D_MS = 1 * 24 * 60 * 60 * 1000
+REMINDER_CHECK_INTERVAL_SECONDS = 3600
+RENEWAL_NOTE = "Для продления напишите администратору. Он продлит подписку вручную и скажет срок."
 
 router = Router()
 
@@ -121,6 +128,49 @@ def _sanitize_nick(user: User | None) -> str:
 
 def _device_label_ru(kind: str) -> str:
     return DEVICE_LABEL_RU.get(kind, kind)
+
+
+def _format_expiry_time_ms(expiry_time_ms: int | None) -> str:
+    if expiry_time_ms is None:
+        return "неизвестно"
+    expiry = datetime.fromtimestamp(expiry_time_ms / 1000, tz=timezone.utc)
+    return expiry.strftime("%d.%m.%Y %H:%M UTC")
+
+
+def _device_subscription_label_from_parts(device_kind: str, slot_index: int) -> str:
+    label = _device_label_ru(device_kind)
+    if slot_index > 1:
+        label += f" ({slot_index})"
+    return label
+
+
+def _subscription_message_text(
+    device_label: str,
+    expiry_time_ms: int | None,
+    link: str,
+    renewal_note: str = "",
+) -> str:
+    parts = [
+        f"{device_label}\n"
+        f"Подписка действует до: {_format_expiry_time_ms(expiry_time_ms)}\n\n"
+    ]
+    if renewal_note:
+        parts.append(f"{renewal_note}\n")
+    parts.append(f"Ссылка на подписку:\n{link}")
+    return "\n".join(parts)
+
+
+def _renewal_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔁 Продлить",
+                    callback_data="renew:info",
+                ),
+            ]
+        ]
+    )
 
 
 def _panel_base_email(nick: str, device_kind: str, slot_index: int) -> str:
@@ -293,32 +343,131 @@ async def _create_subscription_for_user(
     base_email: str,
     device_kind: str,
     slot_index: int,
-) -> tuple[bool, str | None, str]:
+) -> tuple[bool, str | None, int | None, str]:
     """
     Создаёт клиентов в 3x-ui и запись в user_devices.
-    Возвращает (успех, sub_token, текст ошибки для пользователя).
+    Возвращает (успех, sub_token, expiry_time_ms, текст ошибки для пользователя).
     """
     if not PANEL_LOGIN or not PANEL_PASSWORD:
-        return False, None, "Сейчас выдать ссылку нельзя. Напишите администратору."
+        return False, None, None, "Сейчас выдать ссылку нельзя. Напишите администратору."
     client_uuid = str(uuid.uuid4())
     sub = _sub_token()
+    expiry_time_ms = subscription_expiry_time_ms()
     try:
         async with PanelAPI(PANEL_BASE_URL, PANEL_LOGIN, PANEL_PASSWORD) as api:
-            await api.register_user_on_all_inbounds(base_email, client_uuid, sub)
+            await api.register_user_on_all_inbounds(
+                base_email,
+                client_uuid,
+                sub,
+                expiry_time_ms,
+            )
     except PanelAPIError as e:
         logger.warning("Ошибка панели для tg_id=%s: %s", tid, e)
         return (
             False,
             None,
+            None,
             "Не удалось выдать подписку. Попробуйте позже или напишите администратору.",
         )
     except Exception:
         logger.exception("Неожиданная ошибка при регистрации tg_id=%s", tid)
-        return False, None, "Что-то пошло не так. Попробуйте позже."
+        return False, None, None, "Что-то пошло не так. Попробуйте позже."
     await db.create_user_device(
-        tid, device_kind, slot_index, base_email, client_uuid, sub
+        tid,
+        device_kind,
+        slot_index,
+        base_email,
+        client_uuid,
+        sub,
+        expiry_time_ms,
     )
-    return True, sub, ""
+    return True, sub, expiry_time_ms, ""
+
+
+async def _send_subscription_reminder(bot: Bot, device: db.UserDeviceRecord, stage: str) -> bool:
+    label = _device_subscription_label_from_parts(device.device_kind, device.slot_index)
+    expiry = _format_expiry_time_ms(device.expiry_time_ms)
+    if stage == "3d":
+        text = (
+            f"Напоминание: подписка {label} закончится через 3 дня.\n"
+            f"Окончание: {expiry}\n\n"
+            f"{RENEWAL_NOTE}"
+        )
+    elif stage == "1d":
+        text = (
+            f"Напоминание: подписка {label} закончится через 1 день.\n"
+            f"Окончание: {expiry}\n\n"
+            f"{RENEWAL_NOTE}"
+        )
+    else:
+        text = (
+            f"Подписка {label} закончилась.\n"
+            f"Окончание: {expiry}\n\n"
+            f"{RENEWAL_NOTE}"
+        )
+    try:
+        await bot.send_message(device.telegram_id, text)
+    except Exception:
+        logger.exception(
+            "Не удалось отправить напоминание stage=%s tg_id=%s device=%s/%s",
+            stage,
+            device.telegram_id,
+            device.device_kind,
+            device.slot_index,
+        )
+        return False
+    return True
+
+
+async def _send_due_subscription_reminders(bot: Bot) -> None:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    devices = await db.list_all_user_devices()
+    for device in devices:
+        if device.expiry_time_ms is None:
+            continue
+        remaining_ms = device.expiry_time_ms - now_ms
+        if remaining_ms <= 0:
+            if device.expired_notified_at is None:
+                ok = await _send_subscription_reminder(bot, device, "expired")
+                if ok:
+                    await db.mark_subscription_notice_sent(
+                        device.telegram_id,
+                        device.device_kind,
+                        device.slot_index,
+                        "expired",
+                    )
+            continue
+        if remaining_ms <= REMINDER_1D_MS:
+            if device.reminder_1d_sent_at is None:
+                ok = await _send_subscription_reminder(bot, device, "1d")
+                if ok:
+                    await db.mark_subscription_notice_sent(
+                        device.telegram_id,
+                        device.device_kind,
+                        device.slot_index,
+                        "1d",
+                    )
+            continue
+        if remaining_ms <= REMINDER_3D_MS and device.reminder_3d_sent_at is None:
+            ok = await _send_subscription_reminder(bot, device, "3d")
+            if ok:
+                await db.mark_subscription_notice_sent(
+                    device.telegram_id,
+                    device.device_kind,
+                    device.slot_index,
+                    "3d",
+                )
+
+
+async def _subscription_reminder_worker(bot: Bot) -> None:
+    while True:
+        try:
+            await _send_due_subscription_reminders(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка фоновой проверки напоминаний")
+        await asyncio.sleep(REMINDER_CHECK_INTERVAL_SECONDS)
 
 
 @router.message(CommandStart())
@@ -479,11 +628,25 @@ async def my_subscriptions(message: Message) -> None:
         return
     chunks: list[str] = []
     for d in devices:
-        label = _device_label_ru(d.device_kind)
-        if d.slot_index > 1:
-            label += f" ({d.slot_index})"
-        chunks.append(f"{label}\n{_instruction_link(d.sub_token)}")
-    await message.answer("Ваши ссылки на подписку:\n\n" + "\n\n".join(chunks))
+        chunks.append(
+            _subscription_message_text(
+                _device_subscription_label_from_parts(d.device_kind, d.slot_index),
+                d.expiry_time_ms,
+                _instruction_link(d.sub_token),
+                RENEWAL_NOTE,
+            )
+        )
+    await message.answer(
+        "Ваши подписки:\n\n" + "\n\n".join(chunks),
+        reply_markup=_renewal_inline_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "renew:info")
+async def cb_renew_info(query: CallbackQuery) -> None:
+    await query.answer()
+    if query.message:
+        await query.message.answer(RENEWAL_NOTE)
 
 
 @router.callback_query(F.data.startswith("dev:"))
@@ -549,10 +712,10 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
         return
 
-    ok, sub, err = await _create_subscription_for_user(
+    ok, sub, expiry_time_ms, err = await _create_subscription_for_user(
         tid, base_email, kind, slot_index
     )
-    if not ok or sub is None:
+    if not ok or sub is None or expiry_time_ms is None:
         await query.answer((err or "Ошибка")[:200], show_alert=True)
         return
     if query.message:
@@ -561,10 +724,14 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
     link = _instruction_link(sub)
-    dev_ru = _device_label_ru(kind)
     if query.message:
+        label = _device_subscription_label_from_parts(kind, slot_index)
         await query.message.answer(
-            f"{dev_ru}\n\nСсылка на подписку:\n{link}"
+            _subscription_message_text(
+                label,
+                expiry_time_ms,
+                link,
+            )
         )
     await query.answer("Готово")
 
@@ -585,13 +752,13 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("Заявка уже обработана или отозвана.", show_alert=True)
         return
 
-    ok, sub, err = await _create_subscription_for_user(
+    ok, sub, expiry_time_ms, err = await _create_subscription_for_user(
         tid,
         pending.base_email,
         pending.device_kind,
         pending.slot_index,
     )
-    if not ok or sub is None:
+    if not ok or sub is None or expiry_time_ms is None:
         msg = (err or "Ошибка")[:180]
         await query.answer(msg, show_alert=True)
         return
@@ -600,8 +767,14 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
     await query.answer("Доступ выдан.")
 
     link = _instruction_link(sub)
-    dev_ru = _device_label_ru(pending.device_kind)
-    user_text = f"{dev_ru}\n\nСсылка на подписку:\n{link}"
+    user_text = _subscription_message_text(
+        _device_subscription_label_from_parts(
+            pending.device_kind,
+            pending.slot_index,
+        ),
+        expiry_time_ms,
+        link,
+    )
     delivered = False
     try:
         await bot.send_message(tid, user_text)
@@ -704,8 +877,14 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    reminder_task = asyncio.create_task(_subscription_reminder_worker(bot))
     logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        reminder_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reminder_task
 
 
 if __name__ == "__main__":
