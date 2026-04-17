@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from panel_api import subscription_days
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parent / "bot.db"
@@ -18,6 +20,10 @@ class UserDeviceRecord:
     base_email: str
     uuid: str
     sub_token: str
+    expiry_time_ms: int | None
+    reminder_3d_sent_at: str | None
+    reminder_1d_sent_at: str | None
+    expired_notified_at: str | None
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,32 @@ async def _migrate_schema(conn: aiosqlite.Connection) -> None:
         )
         """
     )
+    cur = await conn.execute("PRAGMA table_info(user_devices)")
+    user_device_cols = {r[1] for r in await cur.fetchall()}
+    if "expiry_time_ms" not in user_device_cols:
+        await conn.execute(
+            "ALTER TABLE user_devices ADD COLUMN expiry_time_ms INTEGER"
+        )
+    if "reminder_3d_sent_at" not in user_device_cols:
+        await conn.execute(
+            "ALTER TABLE user_devices ADD COLUMN reminder_3d_sent_at TEXT"
+        )
+    if "reminder_1d_sent_at" not in user_device_cols:
+        await conn.execute(
+            "ALTER TABLE user_devices ADD COLUMN reminder_1d_sent_at TEXT"
+        )
+    if "expired_notified_at" not in user_device_cols:
+        await conn.execute(
+            "ALTER TABLE user_devices ADD COLUMN expired_notified_at TEXT"
+        )
+    await conn.execute(
+        """
+        UPDATE user_devices
+        SET expiry_time_ms = CAST(strftime('%s', created_at) AS INTEGER) * 1000 + (? * 86400000)
+        WHERE expiry_time_ms IS NULL AND created_at IS NOT NULL
+        """,
+        (subscription_days(),),
+    )
     cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
     if await cur.fetchone():
         await conn.execute(
@@ -57,6 +89,14 @@ async def _migrate_schema(conn: aiosqlite.Connection) -> None:
                    'legacy_' || CAST(telegram_id AS TEXT), uuid, sub_token
             FROM users
             """
+        )
+        await conn.execute(
+            """
+            UPDATE user_devices
+            SET expiry_time_ms = CAST(strftime('%s', created_at) AS INTEGER) * 1000 + (? * 86400000)
+            WHERE expiry_time_ms IS NULL AND created_at IS NOT NULL
+            """,
+            (subscription_days(),),
         )
 
     cur = await conn.execute("PRAGMA table_info(access_requests)")
@@ -153,15 +193,24 @@ async def create_user_device(
     base_email: str,
     uuid_val: str,
     sub_token: str,
+    expiry_time_ms: int,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT INTO user_devices
-            (telegram_id, device_kind, slot_index, base_email, uuid, sub_token)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (telegram_id, device_kind, slot_index, base_email, uuid, sub_token, expiry_time_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (telegram_id, device_kind, slot_index, base_email, uuid_val, sub_token),
+            (
+                telegram_id,
+                device_kind,
+                slot_index,
+                base_email,
+                uuid_val,
+                sub_token,
+                expiry_time_ms,
+            ),
         )
         await db.commit()
 
@@ -171,7 +220,9 @@ async def list_user_devices(telegram_id: int) -> list[UserDeviceRecord]:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """
-            SELECT telegram_id, device_kind, slot_index, base_email, uuid, sub_token
+            SELECT telegram_id, device_kind, slot_index, base_email, uuid, sub_token,
+                   expiry_time_ms, reminder_3d_sent_at, reminder_1d_sent_at,
+                   expired_notified_at
             FROM user_devices WHERE telegram_id = ?
             ORDER BY id ASC
             """,
@@ -186,9 +237,69 @@ async def list_user_devices(telegram_id: int) -> list[UserDeviceRecord]:
             base_email=r["base_email"],
             uuid=r["uuid"],
             sub_token=r["sub_token"],
+            expiry_time_ms=r["expiry_time_ms"],
+            reminder_3d_sent_at=r["reminder_3d_sent_at"],
+            reminder_1d_sent_at=r["reminder_1d_sent_at"],
+            expired_notified_at=r["expired_notified_at"],
         )
         for r in rows
     ]
+
+
+async def list_all_user_devices() -> list[UserDeviceRecord]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT telegram_id, device_kind, slot_index, base_email, uuid, sub_token,
+                   expiry_time_ms, reminder_3d_sent_at, reminder_1d_sent_at,
+                   expired_notified_at
+            FROM user_devices
+            ORDER BY id ASC
+            """
+        )
+        rows = await cur.fetchall()
+    return [
+        UserDeviceRecord(
+            telegram_id=r["telegram_id"],
+            device_kind=r["device_kind"],
+            slot_index=r["slot_index"],
+            base_email=r["base_email"],
+            uuid=r["uuid"],
+            sub_token=r["sub_token"],
+            expiry_time_ms=r["expiry_time_ms"],
+            reminder_3d_sent_at=r["reminder_3d_sent_at"],
+            reminder_1d_sent_at=r["reminder_1d_sent_at"],
+            expired_notified_at=r["expired_notified_at"],
+        )
+        for r in rows
+    ]
+
+
+async def mark_subscription_notice_sent(
+    telegram_id: int,
+    device_kind: str,
+    slot_index: int,
+    stage: str,
+) -> None:
+    columns = {
+        "3d": "reminder_3d_sent_at",
+        "1d": "reminder_1d_sent_at",
+        "expired": "expired_notified_at",
+    }
+    column = columns.get(stage)
+    if column is None:
+        raise ValueError(f"Unknown reminder stage: {stage}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"""
+            UPDATE user_devices
+            SET {column} = datetime('now')
+            WHERE telegram_id = ? AND device_kind = ? AND slot_index = ? AND {column} IS NULL
+            """,
+            (telegram_id, device_kind, slot_index),
+        )
+        await db.commit()
 
 
 async def count_distinct_subscribers() -> int:

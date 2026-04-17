@@ -212,9 +212,10 @@ class PanelAPI:
         base_email: str,
         client_uuid: str,
         sub_id: str,
+        expiry_time_ms: int | None = None,
     ) -> None:
         await self.login()
-        expiry_ms = subscription_expiry_time_ms()
+        expiry_ms = expiry_time_ms if expiry_time_ms is not None else subscription_expiry_time_ms()
         proto_map = await self._inbound_protocol_map()
         for iid in INBOUND_IDS:
             email = f"{base_email}_{iid}"
