@@ -18,6 +18,6 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
           script: |
-            cd /root/Tgbot_VPN/Tgbot
+            cd /root/Tgbot
             git fetch --all
             git reset --hard origin/main
