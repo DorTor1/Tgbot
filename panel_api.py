@@ -35,7 +35,13 @@ def subscription_days() -> int:
 
 def subscription_expiry_time_ms() -> int:
     """Момент окончания подписки для 3x-ui (expiryTime в миллисекундах, UTC)."""
-    end = datetime.now(timezone.utc) + timedelta(days=subscription_days())
+    return expiry_time_ms_for_days(subscription_days())
+
+
+def expiry_time_ms_for_days(days: int) -> int:
+    """expiryTime в миллисекундах (UTC) на указанное количество дней от сейчас."""
+    days = max(1, min(int(days), 3650))
+    end = datetime.now(timezone.utc) + timedelta(days=days)
     return int(end.timestamp() * 1000)
 
 
@@ -101,6 +107,40 @@ class PanelAPI:
             msg = body.get("msg", "unknown")
             logger.error("Логин отклонён: %s", msg)
             raise PanelAPIError("Вход в панель отклонён.")
+
+    async def get_sub_config(self) -> dict[str, Any]:
+        """Читает настройки подписки из панели (POST /panel/api/setting/all).
+
+        Возвращает словарь с полями subURI, subPath, subDomain, subPort,
+        subKeyFile, subCertFile, subEnable и т.п. Пустой словарь — если не удалось.
+        """
+        client = self._require_client()
+        try:
+            r = await client.post("/panel/api/setting/all")
+        except httpx.RequestError as e:
+            logger.exception("setting/all: %s", e)
+            raise PanelAPIError("Не удалось получить настройки панели.") from e
+        if r.status_code != 200:
+            raise PanelAPIError(f"setting/all: HTTP {r.status_code}.")
+        try:
+            body = r.json()
+        except json.JSONDecodeError as e:
+            raise PanelAPIError("setting/all: не JSON.") from e
+        if not body.get("success"):
+            raise PanelAPIError("setting/all: отказ панели.")
+        obj = body.get("obj")
+        if not isinstance(obj, dict):
+            return {}
+        keys = (
+            "subEnable",
+            "subURI",
+            "subPath",
+            "subDomain",
+            "subPort",
+            "subKeyFile",
+            "subCertFile",
+        )
+        return {k: obj.get(k) for k in keys if k in obj}
 
     async def _inbound_protocol_map(self) -> dict[int, str]:
         """id inbound → protocol (как в панели: vless, trojan, shadowsocks, …)."""

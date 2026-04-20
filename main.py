@@ -12,6 +12,7 @@ import secrets
 import string
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -28,7 +29,13 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
-from panel_api import PanelAPI, PanelAPIError, subscription_expiry_time_ms
+from panel_api import (
+    PanelAPI,
+    PanelAPIError,
+    expiry_time_ms_for_days,
+    subscription_days,
+    subscription_expiry_time_ms,
+)
 from vpn_rules import RULES_TEXT
 from vpn_user_agreement import AGREEMENT_TEXT
 
@@ -50,10 +57,18 @@ PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
 # Публичная ссылка подписки часто без секретного префикса панели (только хост).
 SUBSCRIPTION_BASE_URL = os.getenv("SUBSCRIPTION_BASE_URL", "").strip().rstrip("/")
 
-# Путь страницы/эндпоинта подписки в панели (как в настройках 3x-ui).
+# Путь страницы/эндпоинта подписки в панели. Если пусто — берётся из настроек
+# самой 3x-ui (POST /panel/api/setting/all → subURI/subPath).
 SUBSCRIPTION_PATH = os.getenv("SUBSCRIPTION_PATH", "").strip()
 # Имя query-параметра для subId (у портала подписки часто ?name=<subId>). bare/legacy — старый вид ?<токен>.
 SUBSCRIPTION_QUERY_PARAM = os.getenv("SUBSCRIPTION_QUERY_PARAM", "name").strip() or "name"
+
+# Варианты срока подписки (в днях), которые админ выбирает кнопкой при одобрении.
+APPROVAL_DURATION_CHOICES: tuple[int, ...] = (7, 30, 90, 180, 365)
+
+# Кэш настроек подписки из панели (subURI, subPath, subDomain, subPort, TLS-файлы).
+# Заполняется при старте бота, обновляется перед каждой выдачей ссылки.
+_sub_config_cache: dict[str, Any] = {}
 
 # Тип устройства → префикс в email панели (до _nick и номера слота).
 EMAIL_PREFIX = {
@@ -187,23 +202,84 @@ def _sub_token() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(10))
 
 
-def _subscription_link_base() -> str:
-    if SUBSCRIPTION_BASE_URL:
-        return SUBSCRIPTION_BASE_URL
+async def _refresh_sub_config() -> dict[str, Any]:
+    """Читает актуальные настройки подписки из панели и кладёт в кэш."""
+    global _sub_config_cache
+    if not PANEL_LOGIN or not PANEL_PASSWORD or not PANEL_BASE_URL:
+        return _sub_config_cache
+    try:
+        async with PanelAPI(PANEL_BASE_URL, PANEL_LOGIN, PANEL_PASSWORD) as api:
+            await api.login()
+            cfg = await api.get_sub_config()
+        if cfg:
+            _sub_config_cache = cfg
+            logger.info("Настройки подписки из панели: %s", cfg)
+    except Exception as e:
+        logger.warning("Не удалось получить настройки подписки из панели: %s", e)
+    return _sub_config_cache
+
+
+def _subscription_link_base_from_panel() -> str:
+    """Собирает базу ссылки подписки по настройкам панели.
+
+    Приоритет: subURI → (схема/домен/порт + subPath) → схема+host из PANEL_BASE_URL + /sub/.
+    """
+    cfg = _sub_config_cache
+    sub_uri = (cfg.get("subURI") or "").strip() if isinstance(cfg, dict) else ""
+    if sub_uri:
+        return sub_uri.rstrip("/")
+
     u = urlparse(PANEL_BASE_URL)
-    if u.scheme and u.netloc:
-        return f"{u.scheme}://{u.netloc}".rstrip("/")
-    return PANEL_BASE_URL
+    sub_path = (cfg.get("subPath") if isinstance(cfg, dict) else None) or "/sub/"
+    sub_path = "/" + sub_path.strip("/")
+    sub_domain = (cfg.get("subDomain") if isinstance(cfg, dict) else None) or ""
+    sub_port = cfg.get("subPort") if isinstance(cfg, dict) else None
+    has_tls = bool(
+        (cfg.get("subKeyFile") if isinstance(cfg, dict) else None)
+        and (cfg.get("subCertFile") if isinstance(cfg, dict) else None)
+    )
+
+    host = sub_domain.strip() or (u.hostname or "")
+    if sub_domain:
+        scheme = "https" if has_tls else "http"
+    else:
+        scheme = u.scheme or ("https" if has_tls else "http")
+
+    try:
+        port_int = int(sub_port) if sub_port is not None else 0
+    except (TypeError, ValueError):
+        port_int = 0
+
+    netloc = host
+    if port_int and port_int not in (80, 443):
+        netloc = f"{host}:{port_int}"
+
+    return f"{scheme}://{netloc}{sub_path}".rstrip("/")
+
+
+def _subscription_link_base() -> str:
+    """База для ссылки подписки. Ручной override в .env сильнее, чем автодетект."""
+    if SUBSCRIPTION_BASE_URL and SUBSCRIPTION_PATH:
+        root = SUBSCRIPTION_BASE_URL.rstrip("/")
+        path = SUBSCRIPTION_PATH.strip("/")
+        return f"{root}/{path}" if path else root
+    if SUBSCRIPTION_BASE_URL and not SUBSCRIPTION_PATH:
+        return SUBSCRIPTION_BASE_URL.rstrip("/")
+    if SUBSCRIPTION_PATH:
+        u = urlparse(PANEL_BASE_URL)
+        root = f"{u.scheme}://{u.netloc}".rstrip("/") if u.scheme and u.netloc else PANEL_BASE_URL
+        return f"{root}/{SUBSCRIPTION_PATH.strip('/')}"
+    return _subscription_link_base_from_panel()
 
 
 def _instruction_link(sub_token: str) -> str:
-    root = _subscription_link_base().rstrip("/")
-    path = SUBSCRIPTION_PATH.strip().strip("/")
-    base = f"{root}/{path}"
+    base = _subscription_link_base().rstrip("/")
     enc = quote(sub_token, safe="")
     q = SUBSCRIPTION_QUERY_PARAM.lower()
     if q in ("bare", "legacy", "none"):
         return f"{base}?{enc}"
+    if q in ("path", "slash"):
+        return f"{base}/{enc}"
     return f"{base}?{quote(SUBSCRIPTION_QUERY_PARAM, safe='')}={enc}"
 
 
@@ -291,20 +367,30 @@ def _agreement_inline_keyboard() -> InlineKeyboardMarkup:
 
 
 def _access_review_keyboard(target_telegram_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Принять",
-                    callback_data=f"apr:{target_telegram_id}",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"rej:{target_telegram_id}",
-                ),
-            ]
+    """Клавиатура одобрения заявки: срок выбирает админ (дни)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for days in APPROVAL_DURATION_CHOICES:
+        row.append(
+            InlineKeyboardButton(
+                text=f"✅ {days} дн.",
+                callback_data=f"apr:{target_telegram_id}:{days}",
+            )
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"rej:{target_telegram_id}",
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _format_request_who(req: db.AccessRequestRecord) -> str:
@@ -326,7 +412,8 @@ async def _notify_admins_new_request(bot: Bot, req: db.AccessRequestRecord) -> N
         f"Кто: {_format_request_who(req)}\n"
         f"Устройство: {_device_label_ru(req.device_kind)}"
         f" (слот {req.slot_index})\n"
-        f"Префикс email в панели: <code>{req.base_email}</code>"
+        f"Префикс email в панели: <code>{req.base_email}</code>\n\n"
+        "Выберите срок подписки или отклоните заявку:"
     )
     kb = _access_review_keyboard(req.telegram_id)
     for admin_id in _admin_ids():
@@ -343,16 +430,20 @@ async def _create_subscription_for_user(
     base_email: str,
     device_kind: str,
     slot_index: int,
+    days: int | None = None,
 ) -> tuple[bool, str | None, int | None, str]:
     """
     Создаёт клиентов в 3x-ui и запись в user_devices.
+    days — срок подписки в днях (если None, берётся SUBSCRIPTION_DAYS).
     Возвращает (успех, sub_token, expiry_time_ms, текст ошибки для пользователя).
     """
     if not PANEL_LOGIN or not PANEL_PASSWORD:
         return False, None, None, "Сейчас выдать ссылку нельзя. Напишите администратору."
     client_uuid = str(uuid.uuid4())
     sub = _sub_token()
-    expiry_time_ms = subscription_expiry_time_ms()
+    expiry_time_ms = (
+        expiry_time_ms_for_days(days) if days is not None else subscription_expiry_time_ms()
+    )
     try:
         async with PanelAPI(PANEL_BASE_URL, PANEL_LOGIN, PANEL_PASSWORD) as api:
             await api.register_user_on_all_inbounds(
@@ -545,12 +636,10 @@ async def cb_terms_accept(query: CallbackQuery) -> None:
         await query.answer()
         return
     await db.set_rules_accepted(query.from_user.id)
-    await query.answer("Спасибо!")
+    await query.answer("Правила приняты")
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        with suppress(Exception):
+            await query.message.delete()
         await query.message.answer(
             AGREEMENT_TEXT
             + "\n\nЧтобы продолжить, подтвердите согласие с пользовательским соглашением — кнопки ниже.",
@@ -586,12 +675,10 @@ async def cb_agreement_accept(query: CallbackQuery) -> None:
         )
         return
     await db.set_agreement_accepted(query.from_user.id)
-    await query.answer("Спасибо!")
+    await query.answer("Соглашение принято")
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        with suppress(Exception):
+            await query.message.delete()
         await query.message.answer(
             _device_selection_text(),
             reply_markup=_device_inline_keyboard(),
@@ -712,6 +799,7 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
         return
 
+    await _refresh_sub_config()
     ok, sub, expiry_time_ms, err = await _create_subscription_for_user(
         tid, base_email, kind, slot_index
     )
@@ -741,22 +829,31 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
     if not _is_admin(query.from_user.id if query.from_user else None):
         await query.answer("Нет прав.", show_alert=True)
         return
+    parts = (query.data or "").split(":")
     try:
-        tid = int(query.data.split(":", 1)[1])
+        tid = int(parts[1])
     except (IndexError, ValueError):
         await query.answer("Неверные данные.", show_alert=True)
         return
+    days: int | None = None
+    if len(parts) >= 3 and parts[2]:
+        try:
+            days = int(parts[2])
+        except ValueError:
+            days = None
 
     pending = await db.get_access_request(tid)
     if pending is None:
         await query.answer("Заявка уже обработана или отозвана.", show_alert=True)
         return
 
+    await _refresh_sub_config()
     ok, sub, expiry_time_ms, err = await _create_subscription_for_user(
         tid,
         pending.base_email,
         pending.device_kind,
         pending.slot_index,
+        days=days,
     )
     if not ok or sub is None or expiry_time_ms is None:
         msg = (err or "Ошибка")[:180]
@@ -864,12 +961,9 @@ async def main() -> None:
         raise SystemExit(
             "Укажите PANEL_BASE_URL в .env (URL до секретного префикса панели, без /panel/ на конце)."
         )
-    if not SUBSCRIPTION_PATH:
-        raise SystemExit(
-            "Укажите SUBSCRIPTION_PATH в .env — сегмент пути из URL подписки в настройках 3x-ui."
-        )
 
     await db.init_db()
+    await _refresh_sub_config()
     if _require_approval() and not _admin_ids():
         logger.warning(
             "REQUIRE_APPROVAL=1, но не заданы ADMINS/ADMIN_ID — заявки некому подтверждать"
