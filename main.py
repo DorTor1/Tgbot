@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
@@ -48,27 +49,86 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PANEL_LOGIN = os.getenv("PANEL_LOGIN", "").strip()
-PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
 # Несколько админов: ADMINS=111,222,333 (приоритетнее одиночного ADMIN_ID)
 ADMINS_RAW = os.getenv("ADMINS", "").strip()
-PANEL_BASE_URL = os.getenv("PANEL_BASE_URL", "").strip().rstrip("/")
-# Публичная ссылка подписки часто без секретного префикса панели (только хост).
-SUBSCRIPTION_BASE_URL = os.getenv("SUBSCRIPTION_BASE_URL", "").strip().rstrip("/")
-
-# Путь страницы/эндпоинта подписки в панели. Если пусто — берётся из настроек
-# самой 3x-ui (POST /panel/api/setting/all → subURI/subPath).
-SUBSCRIPTION_PATH = os.getenv("SUBSCRIPTION_PATH", "").strip()
-# Имя query-параметра для subId (у портала подписки часто ?name=<subId>). bare/legacy — старый вид ?<токен>.
-SUBSCRIPTION_QUERY_PARAM = os.getenv("SUBSCRIPTION_QUERY_PARAM", "name").strip() or "name"
 
 # Варианты срока подписки (в днях), которые админ выбирает кнопкой при одобрении.
 APPROVAL_DURATION_CHOICES: tuple[int, ...] = (7, 30, 90, 180, 365)
 
-# Кэш настроек подписки из панели (subURI, subPath, subDomain, subPort, TLS-файлы).
-# Заполняется при старте бота, обновляется перед каждой выдачей ссылки.
-_sub_config_cache: dict[str, Any] = {}
+
+@dataclass
+class PanelConfig:
+    """Конфиг одной 3x-ui панели (одного VPS)."""
+    index: int
+    name: str  # отображаемое название (гео)
+    base_url: str
+    login: str
+    password: str
+    sub_base_url: str = ""
+    sub_path: str = ""
+    sub_query_param: str = "name"
+    sub_config_cache: dict[str, Any] = field(default_factory=dict)
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _load_panels() -> list[PanelConfig]:
+    """Считывает панели из .env.
+
+    Поддерживает два режима:
+      1. Несколько панелей через суффиксы: PANEL_BASE_URL_1, PANEL_LOGIN_1, ... PANEL_BASE_URL_2 ...
+         Плюс PANEL_NAME_1 (название для пользователя), SUBSCRIPTION_BASE_URL_1 / SUBSCRIPTION_PATH_1 /
+         SUBSCRIPTION_QUERY_PARAM_1 — опциональные override'ы подписки.
+      2. Fallback: одна панель из старых переменных без суффикса.
+    """
+    panels: list[PanelConfig] = []
+    for i in range(1, 21):
+        base_url = _env(f"PANEL_BASE_URL_{i}").rstrip("/")
+        if not base_url:
+            continue
+        login = _env(f"PANEL_LOGIN_{i}")
+        password = _env(f"PANEL_PASSWORD_{i}")
+        name = _env(f"PANEL_NAME_{i}") or f"Сервер {i}"
+        sub_base = _env(f"SUBSCRIPTION_BASE_URL_{i}").rstrip("/")
+        sub_path = _env(f"SUBSCRIPTION_PATH_{i}")
+        sub_qp = _env(f"SUBSCRIPTION_QUERY_PARAM_{i}") or "name"
+        panels.append(
+            PanelConfig(
+                index=i,
+                name=name,
+                base_url=base_url,
+                login=login,
+                password=password,
+                sub_base_url=sub_base,
+                sub_path=sub_path,
+                sub_query_param=sub_qp,
+            )
+        )
+
+    if panels:
+        return panels
+
+    base_url = _env("PANEL_BASE_URL").rstrip("/")
+    if not base_url:
+        return []
+    return [
+        PanelConfig(
+            index=1,
+            name=_env("PANEL_NAME") or "Сервер",
+            base_url=base_url,
+            login=_env("PANEL_LOGIN"),
+            password=_env("PANEL_PASSWORD"),
+            sub_base_url=_env("SUBSCRIPTION_BASE_URL").rstrip("/"),
+            sub_path=_env("SUBSCRIPTION_PATH"),
+            sub_query_param=_env("SUBSCRIPTION_QUERY_PARAM") or "name",
+        )
+    ]
+
+
+PANELS: list[PanelConfig] = _load_panels()
 
 # Тип устройства → префикс в email панели (до _nick и номера слота).
 EMAIL_PREFIX = {
@@ -162,17 +222,28 @@ def _device_subscription_label_from_parts(device_kind: str, slot_index: int) -> 
 def _subscription_message_text(
     device_label: str,
     expiry_time_ms: int | None,
-    link: str,
+    links: list[tuple[str, str]],
     renewal_note: str = "",
 ) -> str:
-    parts = [
+    """links: список (название_сервера, ссылка). Если панель одна — заголовок сервера не печатается."""
+    header = (
         f"{device_label}\n"
-        f"Подписка действует до: {_format_expiry_time_ms(expiry_time_ms)}\n\n"
-    ]
+        f"Подписка действует до: {_format_expiry_time_ms(expiry_time_ms)}"
+    )
+    lines: list[str] = [header, ""]
+    if len(links) == 1:
+        lines.append("Ссылка на подписку:")
+        lines.append(links[0][1])
+    else:
+        lines.append("Ссылки на подписку (добавьте обе в клиент):")
+        for name, link in links:
+            lines.append("")
+            lines.append(f"🌍 {name}:")
+            lines.append(link)
     if renewal_note:
-        parts.append(f"{renewal_note}\n")
-    parts.append(f"Ссылка на подписку:\n{link}")
-    return "\n".join(parts)
+        lines.append("")
+        lines.append(renewal_note)
+    return "\n".join(lines)
 
 
 def _renewal_inline_keyboard() -> InlineKeyboardMarkup:
@@ -202,34 +273,33 @@ def _sub_token() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(10))
 
 
-async def _refresh_sub_config() -> dict[str, Any]:
-    """Читает актуальные настройки подписки из панели и кладёт в кэш."""
-    global _sub_config_cache
-    if not PANEL_LOGIN or not PANEL_PASSWORD or not PANEL_BASE_URL:
-        return _sub_config_cache
-    try:
-        async with PanelAPI(PANEL_BASE_URL, PANEL_LOGIN, PANEL_PASSWORD) as api:
-            await api.login()
-            cfg = await api.get_sub_config()
-        if cfg:
-            _sub_config_cache = cfg
-            logger.info("Настройки подписки из панели: %s", cfg)
-    except Exception as e:
-        logger.warning("Не удалось получить настройки подписки из панели: %s", e)
-    return _sub_config_cache
+async def _refresh_sub_config() -> None:
+    """Читает актуальные настройки подписки для каждой панели и кладёт в её кэш."""
+    for panel in PANELS:
+        if not panel.login or not panel.password or not panel.base_url:
+            continue
+        try:
+            async with PanelAPI(panel.base_url, panel.login, panel.password) as api:
+                await api.login()
+                cfg = await api.get_sub_config()
+            if cfg:
+                panel.sub_config_cache = cfg
+                logger.info("Панель %s (%s): настройки подписки %s", panel.index, panel.name, cfg)
+        except Exception as e:
+            logger.warning(
+                "Панель %s (%s): не удалось получить настройки подписки: %s",
+                panel.index, panel.name, e,
+            )
 
 
-def _subscription_link_base_from_panel() -> str:
-    """Собирает базу ссылки подписки по настройкам панели.
-
-    Приоритет: subURI → (схема/домен/порт + subPath) → схема+host из PANEL_BASE_URL + /sub/.
-    """
-    cfg = _sub_config_cache
+def _subscription_link_base_from_panel(panel: PanelConfig) -> str:
+    """Собирает базу ссылки подписки по настройкам конкретной панели."""
+    cfg = panel.sub_config_cache
     sub_uri = (cfg.get("subURI") or "").strip() if isinstance(cfg, dict) else ""
     if sub_uri:
         return sub_uri.rstrip("/")
 
-    u = urlparse(PANEL_BASE_URL)
+    u = urlparse(panel.base_url)
     sub_path = (cfg.get("subPath") if isinstance(cfg, dict) else None) or "/sub/"
     sub_path = "/" + sub_path.strip("/")
     sub_domain = (cfg.get("subDomain") if isinstance(cfg, dict) else None) or ""
@@ -257,30 +327,39 @@ def _subscription_link_base_from_panel() -> str:
     return f"{scheme}://{netloc}{sub_path}".rstrip("/")
 
 
-def _subscription_link_base() -> str:
-    """База для ссылки подписки. Ручной override в .env сильнее, чем автодетект."""
-    if SUBSCRIPTION_BASE_URL and SUBSCRIPTION_PATH:
-        root = SUBSCRIPTION_BASE_URL.rstrip("/")
-        path = SUBSCRIPTION_PATH.strip("/")
+def _subscription_link_base(panel: PanelConfig) -> str:
+    """База для ссылки подписки конкретной панели. Ручной override в .env сильнее, чем автодетект."""
+    if panel.sub_base_url and panel.sub_path:
+        root = panel.sub_base_url.rstrip("/")
+        path = panel.sub_path.strip("/")
         return f"{root}/{path}" if path else root
-    if SUBSCRIPTION_BASE_URL and not SUBSCRIPTION_PATH:
-        return SUBSCRIPTION_BASE_URL.rstrip("/")
-    if SUBSCRIPTION_PATH:
-        u = urlparse(PANEL_BASE_URL)
-        root = f"{u.scheme}://{u.netloc}".rstrip("/") if u.scheme and u.netloc else PANEL_BASE_URL
-        return f"{root}/{SUBSCRIPTION_PATH.strip('/')}"
-    return _subscription_link_base_from_panel()
+    if panel.sub_base_url and not panel.sub_path:
+        return panel.sub_base_url.rstrip("/")
+    if panel.sub_path:
+        u = urlparse(panel.base_url)
+        root = f"{u.scheme}://{u.netloc}".rstrip("/") if u.scheme and u.netloc else panel.base_url
+        return f"{root}/{panel.sub_path.strip('/')}"
+    return _subscription_link_base_from_panel(panel)
 
 
-def _instruction_link(sub_token: str) -> str:
-    base = _subscription_link_base().rstrip("/")
+def _instruction_link(panel: PanelConfig, sub_token: str) -> str:
+    base = _subscription_link_base(panel).rstrip("/")
     enc = quote(sub_token, safe="")
-    q = SUBSCRIPTION_QUERY_PARAM.lower()
+    q = panel.sub_query_param.lower()
     if q in ("bare", "legacy", "none"):
         return f"{base}?{enc}"
     if q in ("path", "slash"):
         return f"{base}/{enc}"
-    return f"{base}?{quote(SUBSCRIPTION_QUERY_PARAM, safe='')}={enc}"
+    return f"{base}?{quote(panel.sub_query_param, safe='')}={enc}"
+
+
+def _all_links(sub_token: str) -> list[tuple[str, str]]:
+    """Для sub_token возвращает список (название_сервера, ссылка) по всем панелям."""
+    return [(p.name, _instruction_link(p, sub_token)) for p in PANELS]
+
+
+def _panels_configured() -> bool:
+    return any(p.login and p.password and p.base_url for p in PANELS)
 
 
 def _greeting_name(user: User | None) -> str:
@@ -437,32 +516,44 @@ async def _create_subscription_for_user(
     days — срок подписки в днях (если None, берётся SUBSCRIPTION_DAYS).
     Возвращает (успех, sub_token, expiry_time_ms, текст ошибки для пользователя).
     """
-    if not PANEL_LOGIN or not PANEL_PASSWORD:
+    if not _panels_configured():
         return False, None, None, "Сейчас выдать ссылку нельзя. Напишите администратору."
     client_uuid = str(uuid.uuid4())
     sub = _sub_token()
     expiry_time_ms = (
         expiry_time_ms_for_days(days) if days is not None else subscription_expiry_time_ms()
     )
-    try:
-        async with PanelAPI(PANEL_BASE_URL, PANEL_LOGIN, PANEL_PASSWORD) as api:
-            await api.register_user_on_all_inbounds(
-                base_email,
-                client_uuid,
-                sub,
-                expiry_time_ms,
+    # Регистрируем одного и того же клиента на всех сконфигурированных панелях.
+    # Если хоть одна упадёт — считаем это ошибкой (выдать «половину» доступа не хочется).
+    for panel in PANELS:
+        if not panel.login or not panel.password or not panel.base_url:
+            continue
+        try:
+            async with PanelAPI(panel.base_url, panel.login, panel.password) as api:
+                await api.register_user_on_all_inbounds(
+                    base_email,
+                    client_uuid,
+                    sub,
+                    expiry_time_ms,
+                )
+        except PanelAPIError as e:
+            logger.warning(
+                "Ошибка панели %s (%s) для tg_id=%s: %s",
+                panel.index, panel.name, tid, e,
             )
-    except PanelAPIError as e:
-        logger.warning("Ошибка панели для tg_id=%s: %s", tid, e)
-        return (
-            False,
-            None,
-            None,
-            "Не удалось выдать подписку. Попробуйте позже или напишите администратору.",
-        )
-    except Exception:
-        logger.exception("Неожиданная ошибка при регистрации tg_id=%s", tid)
-        return False, None, None, "Что-то пошло не так. Попробуйте позже."
+            return (
+                False,
+                None,
+                None,
+                f"Не удалось выдать подписку на «{panel.name}». "
+                "Попробуйте позже или напишите администратору.",
+            )
+        except Exception:
+            logger.exception(
+                "Неожиданная ошибка при регистрации tg_id=%s на панели %s",
+                tid, panel.index,
+            )
+            return False, None, None, "Что-то пошло не так. Попробуйте позже."
     await db.create_user_device(
         tid,
         device_kind,
@@ -593,8 +684,8 @@ async def get_access(message: Message) -> None:
         await message.answer("Что-то пошло не так. Попробуйте ещё раз.")
         return
 
-    if not PANEL_LOGIN or not PANEL_PASSWORD:
-        logger.error("Не заданы PANEL_LOGIN / PANEL_PASSWORD")
+    if not _panels_configured():
+        logger.error("Не сконфигурирована ни одна панель (PANEL_BASE_URL_* / PANEL_LOGIN_* / PANEL_PASSWORD_*)")
         await message.answer(
             "Сейчас выдать доступ нельзя. Напишите администратору."
         )
@@ -719,7 +810,7 @@ async def my_subscriptions(message: Message) -> None:
             _subscription_message_text(
                 _device_subscription_label_from_parts(d.device_kind, d.slot_index),
                 d.expiry_time_ms,
-                _instruction_link(d.sub_token),
+                _all_links(d.sub_token),
                 RENEWAL_NOTE,
             )
         )
@@ -760,7 +851,7 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         )
         return
 
-    if not PANEL_LOGIN or not PANEL_PASSWORD:
+    if not _panels_configured():
         await query.answer("Сервис временно недоступен.", show_alert=True)
         return
 
@@ -811,14 +902,14 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-    link = _instruction_link(sub)
+    links = _all_links(sub)
     if query.message:
         label = _device_subscription_label_from_parts(kind, slot_index)
         await query.message.answer(
             _subscription_message_text(
                 label,
                 expiry_time_ms,
-                link,
+                links,
             )
         )
     await query.answer("Готово")
@@ -863,14 +954,14 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
     await db.delete_access_request(tid)
     await query.answer("Доступ выдан.")
 
-    link = _instruction_link(sub)
+    links = _all_links(sub)
     user_text = _subscription_message_text(
         _device_subscription_label_from_parts(
             pending.device_kind,
             pending.slot_index,
         ),
         expiry_time_ms,
-        link,
+        links,
     )
     delivered = False
     try:
@@ -892,7 +983,8 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
             else:
                 await query.message.reply(
                     f"Клиенты для <code>{tid}</code> созданы, в личку не доставлено "
-                    f"(нужен чат с ботом). Ссылка:\n{link}",
+                    f"(нужен чат с ботом). Ссылки:\n"
+                    + "\n".join(f"{n}: {l}" for n, l in links),
                     parse_mode="HTML",
                 )
         except Exception:
@@ -957,10 +1049,22 @@ async def cmd_stats(message: Message) -> None:
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Укажите BOT_TOKEN в .env")
-    if not PANEL_BASE_URL:
+    if not PANELS:
         raise SystemExit(
-            "Укажите PANEL_BASE_URL в .env (URL до секретного префикса панели, без /panel/ на конце)."
+            "Укажите хотя бы одну панель: PANEL_BASE_URL_1 / PANEL_LOGIN_1 / PANEL_PASSWORD_1 "
+            "(или старые PANEL_BASE_URL / PANEL_LOGIN / PANEL_PASSWORD для одной панели)."
         )
+    for p in PANELS:
+        if not p.login or not p.password:
+            raise SystemExit(
+                f"Для панели #{p.index} ({p.name}) не задан PANEL_LOGIN_{p.index} "
+                f"или PANEL_PASSWORD_{p.index}."
+            )
+    logger.info(
+        "Сконфигурировано панелей: %d — %s",
+        len(PANELS),
+        ", ".join(f"#{p.index} {p.name} ({p.base_url})" for p in PANELS),
+    )
 
     await db.init_db()
     await _refresh_sub_config()
