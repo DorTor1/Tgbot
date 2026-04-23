@@ -134,6 +134,11 @@ PANELS: list[PanelConfig] = _load_panels()
 # Пример: https://sub.example.com:2096/sub → пользователю: .../sub/<sub_token>
 SUBSCRIPTION_AGGREGATOR_BASE = _env("SUBSCRIPTION_AGGREGATOR_BASE").rstrip("/")
 
+# HTML-страница с инструкцией (репозиторий: index.html). Без ?name= на конце.
+# Пример: https://macbookairm4.mooo.com/Oab4HaruLF — бот добавит ?name=<sub_token>.
+# Страницу нужно отдавать nginx’ом с вашего index.html; иначе откроется портал 3x-ui.
+SUBSCRIPTION_PORTAL_BASE = _env("SUBSCRIPTION_PORTAL_BASE").rstrip("/")
+
 # Краткая инструкция в Telegram при выдаче объединённой подписки (агрегатор).
 SUBSCRIPTION_TG_INSTRUCTION_AGG = """📋 Как подключиться
 
@@ -146,6 +151,18 @@ SUBSCRIPTION_TG_INSTRUCTION_AGG = """📋 Как подключиться
 4. Выберите сервер в списке и включите подключение.
 
 Если ссылка не импортируется — скопируйте её целиком, без пробелов в начале и конце."""
+
+# Когда в .env задан SUBSCRIPTION_PORTAL_BASE — в Telegram короче (детали на странице).
+SUBSCRIPTION_TG_INSTRUCTION_PORTAL = """📋 Откройте ссылку ниже в браузере: на странице инструкция под разные системы и кнопки импорта в клиенты.
+
+Подписка на странице — объединённая (все серверы), как настроено в index.html (URL агрегатора)."""
+
+
+def _subscription_portal_link(sub_token: str) -> str:
+    enc = quote(sub_token, safe="")
+    base = SUBSCRIPTION_PORTAL_BASE
+    return f"{base}&name={enc}" if "?" in base else f"{base}?name={enc}"
+
 
 # Тип устройства → префикс в email панели (до _nick и номера слота).
 EMAIL_PREFIX = {
@@ -247,7 +264,11 @@ def _subscription_message_text(
     )
     lines: list[str] = [header, ""]
     if len(links) == 1:
-        if SUBSCRIPTION_AGGREGATOR_BASE:
+        if SUBSCRIPTION_PORTAL_BASE:
+            lines.append(SUBSCRIPTION_TG_INSTRUCTION_PORTAL)
+            lines.append("")
+            lines.append("Страница с инструкцией и подпиской:")
+        elif SUBSCRIPTION_AGGREGATOR_BASE:
             lines.append(SUBSCRIPTION_TG_INSTRUCTION_AGG)
             lines.append("")
             lines.append("Ссылка на подписку (все серверы в одном профиле):")
@@ -402,7 +423,9 @@ def _instruction_link(panel: PanelConfig, sub_token: str) -> str:
 
 
 def _all_links(sub_token: str) -> list[tuple[str, str]]:
-    """Для sub_token — ссылки пользователю: агрегатор (одна) или по панели."""
+    """Для sub_token — портал с инструкцией, прямая ссылка на агрегатор или по панели."""
+    if SUBSCRIPTION_PORTAL_BASE:
+        return [("Инструкция и подписка", _subscription_portal_link(sub_token))]
     if SUBSCRIPTION_AGGREGATOR_BASE:
         enc = quote(sub_token, safe="")
         return [("Все серверы", f"{SUBSCRIPTION_AGGREGATOR_BASE}/{enc}")]
@@ -1341,10 +1364,20 @@ async def main() -> None:
         len(PANELS),
         ", ".join(f"#{p.index} {p.name} ({p.base_url})" for p in PANELS),
     )
-    if SUBSCRIPTION_AGGREGATOR_BASE:
+    if SUBSCRIPTION_PORTAL_BASE:
+        logger.info(
+            "Ссылки на подписку: HTML-портал %s?name=<sub_token>",
+            SUBSCRIPTION_PORTAL_BASE,
+        )
+    elif SUBSCRIPTION_AGGREGATOR_BASE:
         logger.info(
             "Ссылки на подписку: агрегатор %s/<sub_token>",
             SUBSCRIPTION_AGGREGATOR_BASE,
+        )
+    else:
+        logger.info(
+            "Ссылки на подписку: отдельный URL с каждой панели "
+            "(нет SUBSCRIPTION_PORTAL_BASE и SUBSCRIPTION_AGGREGATOR_BASE)."
         )
 
     await db.init_db()
