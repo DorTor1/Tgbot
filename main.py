@@ -130,6 +130,23 @@ def _load_panels() -> list[PanelConfig]:
 
 PANELS: list[PanelConfig] = _load_panels()
 
+# База URL объединённой подписки (агрегатор за nginx), без токена на конце.
+# Пример: https://sub.example.com:2096/sub → пользователю: .../sub/<sub_token>
+SUBSCRIPTION_AGGREGATOR_BASE = _env("SUBSCRIPTION_AGGREGATOR_BASE").rstrip("/")
+
+# Краткая инструкция в Telegram при выдаче объединённой подписки (агрегатор).
+SUBSCRIPTION_TG_INSTRUCTION_AGG = """📋 Как подключиться
+
+1. Установите клиент с поддержкой VLESS — например v2RayTun или Hiddify (iOS/Android), v2rayN / Hiddify (Windows), v2RayTun (macOS).
+
+2. В приложении выберите добавление подписки по ссылке (часто «Подписка по URL», «Import from URL» или вставка из буфера).
+
+3. Скопируйте ссылку из сообщения ниже и вставьте в клиент. Затем обновите список узлов — появятся серверы из обеих локаций в одном профиле.
+
+4. Выберите сервер в списке и включите подключение.
+
+Если ссылка не импортируется — скопируйте её целиком, без пробелов в начале и конце."""
+
 # Тип устройства → префикс в email панели (до _nick и номера слота).
 EMAIL_PREFIX = {
     "phone": "phone",
@@ -230,7 +247,12 @@ def _subscription_message_text(
     )
     lines: list[str] = [header, ""]
     if len(links) == 1:
-        lines.append("Ссылка на подписку:")
+        if SUBSCRIPTION_AGGREGATOR_BASE:
+            lines.append(SUBSCRIPTION_TG_INSTRUCTION_AGG)
+            lines.append("")
+            lines.append("Ссылка на подписку (все серверы в одном профиле):")
+        else:
+            lines.append("Ссылка на подписку:")
         lines.append(links[0][1])
     else:
         lines.append("Ссылки на подписку (добавьте обе в клиент):")
@@ -380,7 +402,10 @@ def _instruction_link(panel: PanelConfig, sub_token: str) -> str:
 
 
 def _all_links(sub_token: str) -> list[tuple[str, str]]:
-    """Для sub_token возвращает список (название_сервера, ссылка) по всем панелям."""
+    """Для sub_token — ссылки пользователю: агрегатор (одна) или по панели."""
+    if SUBSCRIPTION_AGGREGATOR_BASE:
+        enc = quote(sub_token, safe="")
+        return [("Все серверы", f"{SUBSCRIPTION_AGGREGATOR_BASE}/{enc}")]
     return [(p.name, _instruction_link(p, sub_token)) for p in PANELS]
 
 
@@ -1316,6 +1341,11 @@ async def main() -> None:
         len(PANELS),
         ", ".join(f"#{p.index} {p.name} ({p.base_url})" for p in PANELS),
     )
+    if SUBSCRIPTION_AGGREGATOR_BASE:
+        logger.info(
+            "Ссылки на подписку: агрегатор %s/<sub_token>",
+            SUBSCRIPTION_AGGREGATOR_BASE,
+        )
 
     await db.init_db()
     await _refresh_sub_config()
