@@ -38,6 +38,30 @@ class RenewalRequestRecord:
 
 
 @dataclass(frozen=True)
+class PendingAccessRequestRecord:
+    telegram_id: int
+    username: str | None
+    first_name: str | None
+    last_name: str | None
+    base_email: str
+    device_kind: str
+    slot_index: int
+    created_at: str | None
+
+
+@dataclass(frozen=True)
+class PendingRenewalRequestRecord:
+    telegram_id: int
+    username: str | None
+    first_name: str | None
+    last_name: str | None
+    device_kind: str
+    slot_index: int
+    current_expiry_time_ms: int | None
+    created_at: str | None
+
+
+@dataclass(frozen=True)
 class AccessRequestRecord:
     telegram_id: int
     username: str | None
@@ -367,8 +391,9 @@ async def list_users_legal_status() -> list[dict]:
                 "tid": r[0],
                 "accepted": r[1] is not None and r[2] is not None,
                 "devices": r[3],
-                "username": r[4]
-            } for r in rows
+                "username": r[4],
+            }
+            for r in rows
         ]
 
 
@@ -409,6 +434,33 @@ async def get_access_request(telegram_id: int) -> AccessRequestRecord | None:
         device_kind=row["device_kind"] or "other",
         slot_index=int(row["slot_index"] or 1),
     )
+
+
+async def list_pending_access_requests() -> list[PendingAccessRequestRecord]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT telegram_id, username, first_name, last_name, base_email,
+                   device_kind, slot_index, created_at
+            FROM access_requests
+            ORDER BY created_at ASC, telegram_id ASC
+            """
+        )
+        rows = await cur.fetchall()
+    return [
+        PendingAccessRequestRecord(
+            telegram_id=r["telegram_id"],
+            username=r["username"],
+            first_name=r["first_name"],
+            last_name=r["last_name"],
+            base_email=r["base_email"],
+            device_kind=r["device_kind"] or "other",
+            slot_index=int(r["slot_index"] or 1),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
 
 
 async def try_insert_access_request(
@@ -455,6 +507,22 @@ async def delete_access_request(telegram_id: int) -> None:
             (telegram_id,),
         )
         await db.commit()
+
+
+async def try_claim_access_request(telegram_id: int) -> bool:
+    """Атомарно «забирает» заявку: DELETE + проверка rowcount.
+
+    Возвращает True, если заявка существовала и удалена этим вызовом
+    (значит, текущий админ-обработчик «выиграл гонку»). False — если заявки
+    уже не было (другой обработчик/админ забрал её первым).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM access_requests WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
 
 
 async def has_accepted_usage_rules(telegram_id: int) -> bool:
@@ -633,6 +701,37 @@ async def get_renewal_request(
     )
 
 
+async def list_pending_renewal_requests() -> list[PendingRenewalRequestRecord]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT r.telegram_id, r.username, r.first_name, r.last_name,
+                   r.device_kind, r.slot_index, r.created_at, d.expiry_time_ms
+            FROM renewal_requests r
+            LEFT JOIN user_devices d
+              ON d.telegram_id = r.telegram_id
+             AND d.device_kind = r.device_kind
+             AND d.slot_index = r.slot_index
+            ORDER BY r.created_at ASC, r.telegram_id ASC
+            """
+        )
+        rows = await cur.fetchall()
+    return [
+        PendingRenewalRequestRecord(
+            telegram_id=r["telegram_id"],
+            username=r["username"],
+            first_name=r["first_name"],
+            last_name=r["last_name"],
+            device_kind=r["device_kind"],
+            slot_index=r["slot_index"],
+            current_expiry_time_ms=r["expiry_time_ms"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
 async def delete_renewal_request(
     telegram_id: int, device_kind: str, slot_index: int
 ) -> None:
@@ -645,6 +744,22 @@ async def delete_renewal_request(
             (telegram_id, device_kind, slot_index),
         )
         await db.commit()
+
+
+async def try_claim_renewal_request(
+    telegram_id: int, device_kind: str, slot_index: int
+) -> bool:
+    """Атомарный claim заявки на продление (см. ``try_claim_access_request``)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            DELETE FROM renewal_requests
+            WHERE telegram_id = ? AND device_kind = ? AND slot_index = ?
+            """,
+            (telegram_id, device_kind, slot_index),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
 
 
 async def count_pending_renewals() -> int:

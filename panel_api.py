@@ -297,6 +297,52 @@ class PanelAPI:
             logger.error("updateClient failed inbound=%s: %s", inbound_id, msg)
             raise PanelAPIError(f"Панель не обновила клиента (inbound {inbound_id}): {msg}")
 
+    async def delete_client(self, inbound_id: int, client_uuid: str) -> bool:
+        """Удаляет клиента с inbound по UUID (для отката частичной регистрации).
+
+        Эндпоинт 3x-ui: POST /panel/api/inbounds/{inboundId}/delClient/{clientId}.
+        Возвращает True, если запрос прошёл успешно (включая случай «уже нет»),
+        False — если панель ответила ошибкой. Сетевые ошибки бросаются как PanelAPIError.
+        """
+        client = self._require_client()
+        try:
+            r = await client.post(
+                f"/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
+            )
+        except httpx.RequestError as e:
+            logger.exception("delClient inbound=%s: %s", inbound_id, e)
+            raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
+        if r.status_code != 200:
+            logger.warning(
+                "delClient inbound=%s status=%s body=%s",
+                inbound_id,
+                r.status_code,
+                r.text[:200],
+            )
+            return False
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            return False
+        return bool(body.get("success", False))
+
+    async def delete_client_from_all_inbounds(
+        self, client_uuid: str
+    ) -> int:
+        """Удаляет клиента со всех inbound на панели (для отката). Возвращает успешные."""
+        await self.login()
+        proto_map = await self._inbound_protocol_map()
+        ok = 0
+        for iid in proto_map.keys():
+            try:
+                if await self.delete_client(iid, client_uuid):
+                    ok += 1
+            except PanelAPIError as e:
+                logger.warning(
+                    "Откат: не удалось удалить клиента inbound=%s: %s", iid, e
+                )
+        return ok
+
     async def update_user_on_all_inbounds(
         self,
         base_email: str,
