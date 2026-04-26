@@ -509,6 +509,22 @@ async def delete_access_request(telegram_id: int) -> None:
         await db.commit()
 
 
+async def try_claim_access_request(telegram_id: int) -> bool:
+    """Атомарно «забирает» заявку: DELETE + проверка rowcount.
+
+    Возвращает True, если заявка существовала и удалена этим вызовом
+    (значит, текущий админ-обработчик «выиграл гонку»). False — если заявки
+    уже не было (другой обработчик/админ забрал её первым).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM access_requests WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
 async def has_accepted_usage_rules(telegram_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -728,6 +744,22 @@ async def delete_renewal_request(
             (telegram_id, device_kind, slot_index),
         )
         await db.commit()
+
+
+async def try_claim_renewal_request(
+    telegram_id: int, device_kind: str, slot_index: int
+) -> bool:
+    """Атомарный claim заявки на продление (см. ``try_claim_access_request``)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            DELETE FROM renewal_requests
+            WHERE telegram_id = ? AND device_kind = ? AND slot_index = ?
+            """,
+            (telegram_id, device_kind, slot_index),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
 
 
 async def count_pending_renewals() -> int:

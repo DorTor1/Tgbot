@@ -162,7 +162,7 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         return
     await safe_clear_markup(query)
     links = all_links(sub)
-    if query.message:
+    if query.message and links:
         label = device_subscription_label(kind, slot_index)
         await query.message.answer(
             access_granted_text(label, format_expiry_time_ms(expiry_time_ms)),
@@ -198,7 +198,11 @@ async def cb_admin_approve(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("Заявка уже обработана.", show_alert=True)
         await safe_clear_markup(query)
         return
-    await db.delete_access_request(tid)
+    if not await db.try_claim_access_request(tid):
+        # Между чтением и клеймом заявку забрал другой обработчик.
+        await query.answer("Заявка уже обработана.", show_alert=True)
+        await safe_clear_markup(query)
+        return
 
     await refresh_sub_config()
     ok, sub, expiry_time_ms, err = await create_subscription_for_user(
@@ -227,17 +231,22 @@ async def cb_admin_approve(query: CallbackQuery, bot: Bot) -> None:
     links = all_links(sub)
     label = device_subscription_label(pending.device_kind, pending.slot_index)
     delivered = False
-    try:
-        await bot.send_message(
-            tid,
-            access_granted_text(label, format_expiry_time_ms(expiry_time_ms)),
-            reply_markup=link_keyboard(
-                links[0][1], pending.device_kind, pending.slot_index
-            ),
+    if links:
+        try:
+            await bot.send_message(
+                tid,
+                access_granted_text(label, format_expiry_time_ms(expiry_time_ms)),
+                reply_markup=link_keyboard(
+                    links[0][1], pending.device_kind, pending.slot_index
+                ),
+            )
+            delivered = True
+        except Exception:
+            logger.exception("Не удалось написать пользователю %s", tid)
+    else:
+        logger.error(
+            "Нет ссылок подписки для tg_id=%s — не настроены панели/портал.", tid
         )
-        delivered = True
-    except Exception:
-        logger.exception("Не удалось написать пользователю %s", tid)
 
     await safe_clear_markup(query)
     if query.message:

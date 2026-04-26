@@ -91,6 +91,11 @@ async def cb_links(query: CallbackQuery) -> None:
     )
     for i, d in enumerate(devices, start=1):
         links = all_links(d.sub_token)
+        if not links:
+            await query.message.answer(
+                "Не настроены источники ссылок подписки. Напишите администратору."
+            )
+            return
         primary_url = links[0][1]
         icon, status = subscription_status(d.expiry_time_ms)
         label = device_subscription_label(d.device_kind, d.slot_index)

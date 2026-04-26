@@ -104,8 +104,9 @@ async def create_subscription_for_user(
                 tid,
                 e,
             )
-            if succeeded:
-                await _rollback_on_panels(succeeded, client_uuid)
+            # Откатываем как уже успешные панели, так и текущую: на ней могли
+            # успеть зарегистрировать клиента в части inbound до сбоя.
+            await _rollback_on_panels(succeeded + [panel], client_uuid)
             return (
                 False,
                 None,
@@ -119,8 +120,7 @@ async def create_subscription_for_user(
                 tid,
                 panel.index,
             )
-            if succeeded:
-                await _rollback_on_panels(succeeded, client_uuid)
+            await _rollback_on_panels(succeeded + [panel], client_uuid)
             return False, None, None, "Что-то пошло не так. Попробуйте позже."
 
     await db.create_user_device(

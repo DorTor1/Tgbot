@@ -93,8 +93,11 @@ async def cb_renewal_approve(query: CallbackQuery, bot: Bot) -> None:
         await safe_clear_markup(query)
         return
 
-    # Claim до выполнения операции — защита от двойного клика.
-    await db.delete_renewal_request(tid, device_kind, slot_index)
+    # Атомарный claim до выполнения операции — защита от двойного клика.
+    if not await db.try_claim_renewal_request(tid, device_kind, slot_index):
+        await query.answer("Заявка уже обработана или отозвана.", show_alert=True)
+        await safe_clear_markup(query)
+        return
 
     ok, new_expiry_ms, err = await extend_subscription_for_user(
         tid, device_kind, slot_index, days
