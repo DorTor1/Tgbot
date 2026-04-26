@@ -17,7 +17,7 @@ from formatting import (
 )
 from texts import (
     ACCESS_REQUEST_PENDING,
-    CABINET_NO_DEVICES_HINT,
+    cabinet_no_devices_hint,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ async def cabinet_view(user: User | None) -> tuple[str, bool, bool]:
         lines.append("")
 
     if not devices:
-        lines.append(CABINET_NO_DEVICES_HINT)
+        lines.append(cabinet_no_devices_hint())
         return "\n".join(lines), False, pending is not None
 
     active = sum(1 for d in devices if d.expiry_time_ms and (d.expiry_time_ms > _now_ms()))
