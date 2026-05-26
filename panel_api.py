@@ -74,6 +74,11 @@ class PanelAPI:
         p = path.lstrip("/")
         return f"{self._base}/{p}"
 
+    def _panel_api_urls(self, path: str) -> tuple[str, str]:
+        """Варианты URL для API панели: со слэшем (новые 3x-ui) и без (старые)."""
+        p = path.lstrip("/").rstrip("/")
+        return f"{self._base}/{p}/", f"{self._base}/{p}"
+
     def _csrf_headers(self) -> dict[str, str]:
         if not self._csrf_token:
             return {}
@@ -190,10 +195,9 @@ class PanelAPI:
         subKeyFile, subCertFile, subEnable и т.п. Пустой словарь — если не удалось.
         """
         client = self._require_client()
-        urls = (
-            self._abs_url("panel/setting/all"),
-            self._abs_url("panel/api/setting/all"),
-        )
+        slash, plain = self._panel_api_urls("panel/setting/all")
+        legacy_slash, legacy_plain = self._panel_api_urls("panel/api/setting/all")
+        urls = (slash, plain, legacy_slash, legacy_plain)
         last_status = 0
         r: httpx.Response | None = None
         for url in urls:
@@ -203,8 +207,7 @@ class PanelAPI:
                 logger.exception("setting/all: %s", e)
                 raise PanelAPIError("Не удалось получить настройки панели.") from e
             last_status = r.status_code
-            if r.status_code == 404 and url == urls[0]:
-                logger.info("setting/all: 404 на новом пути, пробуем legacy panel/api/...")
+            if r.status_code == 404:
                 continue
             break
         if r is None:
@@ -236,11 +239,17 @@ class PanelAPI:
     async def _inbound_protocol_map(self) -> dict[int, str]:
         """id inbound → protocol (как в панели: vless, trojan, shadowsocks, …)."""
         client = self._require_client()
+        r: httpx.Response | None = None
         try:
-            r = await client.get(self._abs_url("panel/api/inbounds/list"))
+            for url in self._panel_api_urls("panel/api/inbounds/list"):
+                r = await client.get(url)
+                if r.status_code != 404:
+                    break
         except httpx.RequestError as e:
             logger.exception("inbounds/list: %s", e)
             raise PanelAPIError("Не удалось получить список inbound.") from e
+        if r is None:
+            raise PanelAPIError("Список inbound: нет ответа панели.")
         if r.status_code != 200:
             raise PanelAPIError(f"Список inbound: HTTP {r.status_code}.")
         try:
@@ -312,15 +321,21 @@ class PanelAPI:
             "id": inbound_id,
             "settings": json.dumps(settings_obj, separators=(",", ":")),
         }
+        r: httpx.Response | None = None
         try:
-            r = await client.post(
-                self._abs_url("panel/api/inbounds/addClient"),
-                json=payload,
-                headers=self._csrf_headers(),
-            )
+            for url in self._panel_api_urls("panel/api/inbounds/addClient"):
+                r = await client.post(
+                    url,
+                    json=payload,
+                    headers=self._csrf_headers(),
+                )
+                if r.status_code != 404:
+                    break
         except httpx.RequestError as e:
             logger.exception("addClient inbound=%s: %s", inbound_id, e)
             raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
+        if r is None:
+            raise PanelAPIError("addClient: нет ответа панели.")
 
         logger.info(
             "addClient inbound=%s status=%s body=%s",
@@ -366,15 +381,22 @@ class PanelAPI:
             "id": inbound_id,
             "settings": json.dumps(settings_obj, separators=(",", ":")),
         }
+        path = f"panel/api/inbounds/updateClient/{client_uuid}"
+        r: httpx.Response | None = None
         try:
-            r = await client.post(
-                self._abs_url(f"panel/api/inbounds/updateClient/{client_uuid}"),
-                json=payload,
-                headers=self._csrf_headers(),
-            )
+            for url in self._panel_api_urls(path):
+                r = await client.post(
+                    url,
+                    json=payload,
+                    headers=self._csrf_headers(),
+                )
+                if r.status_code != 404:
+                    break
         except httpx.RequestError as e:
             logger.exception("updateClient inbound=%s: %s", inbound_id, e)
             raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
+        if r is None:
+            raise PanelAPIError("updateClient: нет ответа панели.")
 
         logger.info(
             "updateClient inbound=%s status=%s body=%s",
