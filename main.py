@@ -34,6 +34,8 @@ from panel_api import (
     PanelAPI,
     PanelAPIError,
     expiry_time_ms_for_days,
+    inbound_ids_config,
+    panel_client_email,
     subscription_days,
     subscription_expiry_time_ms,
 )
@@ -900,7 +902,8 @@ async def admin_user_info(message: Message) -> None:
         expiry = _format_expiry_time_ms(d.expiry_time_ms)
         lines.append(f"🔹 {label}")
         lines.append(f"   Срок: {expiry}")
-        lines.append(f"   Email: <code>{d.base_email}_{d.slot_index}</code>")
+        panel_email = panel_client_email(d.base_email, list(inbound_ids_config()))
+        lines.append(f"   Email в панели: <code>{panel_email}</code>")
         lines.append(f"   UUID: <code>{d.uuid}</code>\n")
 
     await message.answer("\n".join(lines), parse_mode="HTML")

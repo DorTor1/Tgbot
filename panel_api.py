@@ -1,4 +1,4 @@
-"""Клиент 3x-ui: логин и добавление клиента во inbound."""
+"""Клиент 3x-ui v3.x: логин, клиенты (/panel/api/clients/*), настройки подписки."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-INBOUND_IDS = (1, 2, 3, 4)
+_DEFAULT_INBOUND_IDS = (1, 2, 3, 4)
+
+
 def vless_flow_inbound_id() -> int:
     try:
         return int(os.getenv("VLESS_FLOW_INBOUND_ID", "1"))
@@ -46,14 +48,46 @@ def expiry_time_ms_for_days(days: int) -> int:
     return int(end.timestamp() * 1000)
 
 
+def panel_api_mode() -> str:
+    """Режим API: v3 (3x-ui 3.x, по умолчанию), legacy (2.x), auto (определить)."""
+    v = os.getenv("PANEL_API_MODE", "v3").strip().lower()
+    if v in ("v3", "legacy", "auto"):
+        return v
+    return "v3"
+
+
+def inbound_ids_config() -> tuple[int, ...]:
+    """Inbound id для привязки клиента (пересекаются с тем, что есть на панели)."""
+    raw = os.getenv("PANEL_INBOUND_IDS", "").strip()
+    if not raw:
+        return _DEFAULT_INBOUND_IDS
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return tuple(out) if out else _DEFAULT_INBOUND_IDS
+
+
+def panel_client_email(base_email: str, inbound_ids: list[int] | None = None) -> str:
+    """Канонический email клиента в 3x-ui v3 (один на все inbound)."""
+    ids = inbound_ids or list(inbound_ids_config())
+    if not ids:
+        return base_email
+    return f"{base_email}_{min(ids)}"
+
+
 class PanelAPIError(Exception):
     """Ошибка API панели или сети."""
 
 
 class PanelAPI:
-    """Клиент 3x-ui. Новые версии (Vue 3 / CSRF): токен с GET /csrf-token, заголовок X-CSRF-Token для POST."""
+    """Клиент 3x-ui 3.x: CSRF, POST /panel/api/clients/add, GET /panel/api/inbounds/list."""
 
-    # Совпадает с web/session/csrf.go в 3x-ui
     _CSRF_HEADER = "X-CSRF-Token"
 
     def __init__(
@@ -69,18 +103,20 @@ class PanelAPI:
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._csrf_token: str | None = None
-        # None — ещё не определено; True — 3x-ui v3+ (/panel/api/clients/*)
         self._clients_api_v3: bool | None = None
 
     def _abs_url(self, path: str) -> str:
-        """Полный URL относительно корня панели (учитывает webBasePath в PANEL_BASE_URL)."""
         p = path.lstrip("/")
         return f"{self._base}/{p}"
 
     def _panel_api_urls(self, path: str) -> tuple[str, str]:
-        """Варианты URL для API панели: со слэшем (новые 3x-ui) и без (старые)."""
         p = path.lstrip("/").rstrip("/")
         return f"{self._base}/{p}/", f"{self._base}/{p}"
+
+    def _api_headers(self) -> dict[str, str]:
+        h = {"X-Requested-With": "XMLHttpRequest"}
+        h.update(self._csrf_headers())
+        return h
 
     def _csrf_headers(self) -> dict[str, str]:
         if not self._csrf_token:
@@ -88,11 +124,10 @@ class PanelAPI:
         return {self._CSRF_HEADER: self._csrf_token}
 
     async def _fetch_public_csrf_token(self) -> None:
-        """Публичный GET /csrf-token до логина (нужен для POST /login на новых панелях)."""
         client = self._require_client()
         url = self._abs_url("csrf-token")
         try:
-            r = await client.get(url)
+            r = await client.get(url, headers={"X-Requested-With": "XMLHttpRequest"})
         except httpx.RequestError as e:
             logger.debug("csrf-token (public): сеть %s", e)
             return
@@ -111,11 +146,10 @@ class PanelAPI:
             logger.info("Получен CSRF-токен (публичный endpoint)")
 
     async def _fetch_panel_csrf_token(self) -> None:
-        """После логина: GET /panel/csrf-token (как SPA) — на случай смены токена в сессии."""
         client = self._require_client()
         url = self._abs_url("panel/csrf-token")
         try:
-            r = await client.get(url)
+            r = await client.get(url, headers=self._api_headers())
         except httpx.RequestError as e:
             logger.debug("panel/csrf-token: сеть %s", e)
             return
@@ -139,6 +173,7 @@ class PanelAPI:
             follow_redirects=True,
         )
         self._csrf_token = None
+        self._clients_api_v3 = None
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -159,7 +194,7 @@ class PanelAPI:
             r = await client.post(
                 login_url,
                 data={"username": self._username, "password": self._password},
-                headers=self._csrf_headers(),
+                headers=self._api_headers(),
             )
         except httpx.RequestError as e:
             logger.exception("Панель недоступна при логине: %s", e)
@@ -169,7 +204,7 @@ class PanelAPI:
         if r.status_code == 403:
             logger.warning("Логин 403 (часто CSRF). Ответ: %s", r.text[:500])
             raise PanelAPIError(
-                "Доступ к панели отклонён (403). Обновите бота или проверьте версию 3x-ui / CSRF."
+                "Доступ к панели отклонён (403). Проверьте CSRF и версию 3x-ui."
             )
         if r.status_code != 200:
             logger.warning("Ответ логина: %s", r.text[:500])
@@ -188,35 +223,74 @@ class PanelAPI:
 
         await self._fetch_panel_csrf_token()
 
-    async def get_sub_config(self) -> dict[str, Any]:
-        """Читает настройки подписки из панели.
-
-        Новые 3x-ui (Vue 3): POST /panel/setting/all.
-        Старые: POST /panel/api/setting/all.
-
-        Возвращает словарь с полями subURI, subPath, subDomain, subPort,
-        subKeyFile, subCertFile, subEnable и т.п. Пустой словарь — если не удалось.
-        """
+    async def _request_panel(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> httpx.Response:
         client = self._require_client()
-        slash, plain = self._panel_api_urls("panel/setting/all")
-        legacy_slash, legacy_plain = self._panel_api_urls("panel/api/setting/all")
-        urls = (slash, plain, legacy_slash, legacy_plain)
-        last_status = 0
         r: httpx.Response | None = None
-        for url in urls:
+        for url in self._panel_api_urls(path):
             try:
-                r = await client.post(url, headers=self._csrf_headers())
+                if method == "GET":
+                    r = await client.get(url, headers=self._api_headers())
+                else:
+                    r = await client.post(
+                        url,
+                        json=json_body,
+                        headers=self._api_headers(),
+                    )
             except httpx.RequestError as e:
-                logger.exception("setting/all: %s", e)
-                raise PanelAPIError("Не удалось получить настройки панели.") from e
-            last_status = r.status_code
-            if r.status_code == 404:
+                logger.exception("%s %s: %s", method, path, e)
+                raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
+            if r.status_code != 404:
+                break
+        if r is None:
+            raise PanelAPIError(f"{method} {path}: нет ответа панели.")
+        return r
+
+    def _check_panel_json_response(
+        self, r: httpx.Response, op_name: str, detail: str = ""
+    ) -> None:
+        suffix = f" ({detail})" if detail else ""
+        logger.info(
+            "%s status=%s body=%s",
+            op_name,
+            r.status_code,
+            (r.text[:400] + "…") if len(r.text) > 400 else r.text,
+        )
+        if r.status_code != 200:
+            raise PanelAPIError(f"{op_name}: HTTP {r.status_code}{suffix}.")
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            raise PanelAPIError(f"{op_name}: не JSON{suffix}.")
+        if not body.get("success", False):
+            msg = body.get("msg", str(body))
+            raise PanelAPIError(f"{op_name}: {msg}{suffix}")
+
+    async def get_sub_config(self) -> dict[str, Any]:
+        """Настройки подписки: POST /panel/setting/all (3x-ui 3.x)."""
+        r: httpx.Response | None = None
+        last_status = 0
+        for path in ("panel/setting/all", "panel/api/setting/all"):
+            try:
+                candidate = await self._request_panel("POST", path)
+            except PanelAPIError:
                 continue
+            last_status = candidate.status_code
+            if candidate.status_code == 404:
+                continue
+            r = candidate
             break
         if r is None:
-            raise PanelAPIError("setting/all: нет ответа.")
+            raise PanelAPIError(
+                f"setting/all: не удалось получить настройки (HTTP {last_status})."
+            )
         if r.status_code == 403:
-            raise PanelAPIError("setting/all: 403 — сессия или CSRF (обновите бота).")
+            raise PanelAPIError("setting/all: 403 — сессия или CSRF.")
         if r.status_code != 200:
             raise PanelAPIError(f"setting/all: HTTP {r.status_code}.")
         try:
@@ -240,53 +314,12 @@ class PanelAPI:
         return {k: obj.get(k) for k in keys if k in obj}
 
     async def _inbound_protocol_map(self) -> dict[int, str]:
-        """id inbound → protocol (как в панели: vless, trojan, shadowsocks, …)."""
-        client = self._require_client()
-        r: httpx.Response | None = None
-        try:
-            for url in self._panel_api_urls("panel/api/inbounds/list"):
-                r = await client.get(url)
-                if r.status_code != 404:
-                    break
-        except httpx.RequestError as e:
-            logger.exception("inbounds/list: %s", e)
-            raise PanelAPIError("Не удалось получить список inbound.") from e
-        if r is None:
-            raise PanelAPIError("Список inbound: нет ответа панели.")
-        if r.status_code != 200:
-            raise PanelAPIError(f"Список inbound: HTTP {r.status_code}.")
-        try:
-            body = r.json()
-        except json.JSONDecodeError as e:
-            raise PanelAPIError("Список inbound: не JSON.") from e
-        if not body.get("success"):
-            raise PanelAPIError("Список inbound: отказ панели.")
-        raw = body.get("obj")
-        if not isinstance(raw, list):
-            return {}
+        """id inbound → protocol. Сначала /inbounds/options, затем /list."""
         out: dict[int, str] = {}
-        for row in raw:
-            if not isinstance(row, dict):
-                continue
+        for path in ("panel/api/inbounds/options", "panel/api/inbounds/list"):
             try:
-                iid = int(row["id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            proto = row.get("protocol")
-            out[iid] = proto if isinstance(proto, str) else ""
-        logger.info("Протоколы inbound: %s", out)
-        return out
-
-    async def _uses_clients_api_v3(self) -> bool:
-        """Новые 3x-ui (Vue 3): клиенты через /panel/api/clients/*, без addClient."""
-        if self._clients_api_v3 is not None:
-            return self._clients_api_v3
-        client = self._require_client()
-        found = False
-        for url in self._panel_api_urls("panel/api/clients/list"):
-            try:
-                r = await client.get(url, headers=self._csrf_headers())
-            except httpx.RequestError:
+                r = await self._request_panel("GET", path)
+            except PanelAPIError:
                 continue
             if r.status_code != 200:
                 continue
@@ -294,28 +327,62 @@ class PanelAPI:
                 body = r.json()
             except json.JSONDecodeError:
                 continue
-            if body.get("success"):
-                found = True
+            if not body.get("success"):
+                continue
+            raw = body.get("obj")
+            if not isinstance(raw, list):
+                continue
+            for row in raw:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    iid = int(row["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                proto = row.get("protocol")
+                out[iid] = proto if isinstance(proto, str) else ""
+            if out:
                 break
-        self._clients_api_v3 = found
-        if found:
-            logger.info(
-                "Панель %s: API клиентов v3 (POST /panel/api/clients/add)",
-                self._base,
-            )
-        else:
-            logger.info(
-                "Панель %s: legacy API (POST /panel/api/inbounds/addClient)",
-                self._base,
-            )
-        return found
+        if not out:
+            raise PanelAPIError("Не удалось получить список inbound с панели.")
+        logger.info("Протоколы inbound: %s", out)
+        return out
 
-    @staticmethod
-    def _primary_client_email(base_email: str, inbound_ids: list[int]) -> str:
-        """Email клиента: на v3 один на все inbound, суффикс — минимальный id."""
-        if not inbound_ids:
-            return base_email
-        return f"{base_email}_{min(inbound_ids)}"
+    def _target_inbound_ids(self, proto_map: dict[int, str]) -> list[int]:
+        configured = set(inbound_ids_config())
+        available = set(proto_map.keys())
+        chosen = sorted(configured & available)
+        if chosen:
+            return chosen
+        return sorted(available)
+
+    async def _uses_clients_api_v3(self) -> bool:
+        if self._clients_api_v3 is not None:
+            return self._clients_api_v3
+        mode = panel_api_mode()
+        if mode == "v3":
+            self._clients_api_v3 = True
+            logger.info("Панель %s: режим API v3 (3x-ui 3.x)", self._base)
+            return True
+        if mode == "legacy":
+            self._clients_api_v3 = False
+            logger.info("Панель %s: режим legacy API (2.x)", self._base)
+            return False
+        try:
+            r = await self._request_panel("GET", "panel/api/clients/list")
+            body = r.json()
+            found = r.status_code == 200 and bool(body.get("success"))
+        except (PanelAPIError, json.JSONDecodeError):
+            found = False
+        self._clients_api_v3 = found
+        logger.info(
+            "Панель %s: %s",
+            self._base,
+            "API v3 (/panel/api/clients/*)"
+            if found
+            else "legacy (/panel/api/inbounds/addClient)",
+        )
+        return found
 
     def _v3_client_body(
         self,
@@ -344,51 +411,6 @@ class PanelAPI:
             row["flow"] = vless_flow_value()
         return row
 
-    async def _post_json_panel(
-        self,
-        path: str,
-        payload: dict[str, Any],
-        *,
-        op_name: str,
-    ) -> httpx.Response:
-        client = self._require_client()
-        r: httpx.Response | None = None
-        for url in self._panel_api_urls(path):
-            try:
-                r = await client.post(
-                    url,
-                    json=payload,
-                    headers=self._csrf_headers(),
-                )
-            except httpx.RequestError as e:
-                logger.exception("%s: %s", op_name, e)
-                raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
-            if r.status_code != 404:
-                break
-        if r is None:
-            raise PanelAPIError(f"{op_name}: нет ответа панели.")
-        return r
-
-    def _check_panel_json_response(
-        self, r: httpx.Response, op_name: str, detail: str = ""
-    ) -> None:
-        suffix = f" ({detail})" if detail else ""
-        logger.info(
-            "%s status=%s body=%s",
-            op_name,
-            r.status_code,
-            (r.text[:400] + "…") if len(r.text) > 400 else r.text,
-        )
-        if r.status_code != 200:
-            raise PanelAPIError(f"{op_name}: HTTP {r.status_code}{suffix}.")
-        try:
-            body = r.json()
-        except json.JSONDecodeError:
-            raise PanelAPIError(f"{op_name}: не JSON{suffix}.")
-        if not body.get("success", False):
-            msg = body.get("msg", str(body))
-            raise PanelAPIError(f"{op_name}: {msg}{suffix}")
-
     async def _add_client_v3(
         self,
         base_email: str,
@@ -398,38 +420,35 @@ class PanelAPI:
         inbound_ids: list[int],
         proto_map: dict[int, str],
     ) -> None:
-        email = self._primary_client_email(base_email, inbound_ids)
+        email = panel_client_email(base_email, inbound_ids)
         payload = {
             "client": self._v3_client_body(
                 email, client_uuid, sub_id, expiry_time_ms, inbound_ids, proto_map
             ),
             "inboundIds": inbound_ids,
         }
-        r = await self._post_json_panel(
-            "panel/api/clients/add",
-            payload,
-            op_name="clients/add",
+        r = await self._request_panel(
+            "POST", "panel/api/clients/add", json_body=payload
         )
         self._check_panel_json_response(
-            r, "clients/add", f"inbounds={inbound_ids}"
+            r, "clients/add", f"email={email} inbounds={inbound_ids}"
         )
 
     async def _update_client_v3(
         self,
-        base_email: str,
+        email: str,
         client_uuid: str,
         sub_id: str,
         expiry_time_ms: int,
         inbound_ids: list[int],
         proto_map: dict[int, str],
     ) -> None:
-        email = self._primary_client_email(base_email, inbound_ids)
-        enc_email = quote(email, safe="")
-        path = f"panel/api/clients/update/{enc_email}"
+        enc = quote(email, safe="")
+        path = f"panel/api/clients/update/{enc}"
         payload = self._v3_client_body(
             email, client_uuid, sub_id, expiry_time_ms, inbound_ids, proto_map
         )
-        r = await self._post_json_panel(path, payload, op_name="clients/update")
+        r = await self._request_panel("POST", path, json_body=payload)
         self._check_panel_json_response(r, "clients/update", email)
 
     @staticmethod
@@ -441,11 +460,6 @@ class PanelAPI:
         expiry_time_ms: int,
         inbound_id: int,
     ) -> dict[str, Any]:
-        """
-        В 3x-ui для trojan валидируется поле password, для vless/vmess — id.
-        См. AddInboundClient в web/service/inbound.go (switch oldInbound.Protocol).
-        expiryTime — срок клиента в панели (мс, модель database/model.Client).
-        """
         proto = (protocol or "").strip().lower()
         common = {
             "email": email,
@@ -454,23 +468,21 @@ class PanelAPI:
             "expiryTime": expiry_time_ms,
         }
         if proto == "trojan":
-            # В панели для trojan проверяется password, а не id (inbound.go AddInboundClient).
             return {"password": client_uuid, **common}
         row: dict[str, Any] = {"id": client_uuid, **common}
         if inbound_id == vless_flow_inbound_id() and proto == "vless":
             row["flow"] = vless_flow_value()
         return row
 
-    async def add_client(
+    async def _add_client_legacy(
         self,
         inbound_id: int,
         client_uuid: str,
         email: str,
         sub_id: str,
-        protocol: str = "",
-        expiry_time_ms: int = 0,
+        protocol: str,
+        expiry_time_ms: int,
     ) -> None:
-        client = self._require_client()
         client_row = self._client_json_for_protocol(
             protocol, client_uuid, email, sub_id, expiry_time_ms, inbound_id
         )
@@ -479,58 +491,22 @@ class PanelAPI:
             "id": inbound_id,
             "settings": json.dumps(settings_obj, separators=(",", ":")),
         }
-        r: httpx.Response | None = None
-        try:
-            for url in self._panel_api_urls("panel/api/inbounds/addClient"):
-                r = await client.post(
-                    url,
-                    json=payload,
-                    headers=self._csrf_headers(),
-                )
-                if r.status_code != 404:
-                    break
-        except httpx.RequestError as e:
-            logger.exception("addClient inbound=%s: %s", inbound_id, e)
-            raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
-        if r is None:
-            raise PanelAPIError("addClient: нет ответа панели.")
-
-        logger.info(
-            "addClient inbound=%s status=%s body=%s",
-            inbound_id,
-            r.status_code,
-            (r.text[:400] + "…") if len(r.text) > 400 else r.text,
+        r = await self._request_panel(
+            "POST", "panel/api/inbounds/addClient", json_body=payload
+        )
+        self._check_panel_json_response(
+            r, "inbounds/addClient", f"inbound={inbound_id}"
         )
 
-        if r.status_code != 200:
-            raise PanelAPIError(f"Панель вернула HTTP {r.status_code} для inbound {inbound_id}.")
-
-        try:
-            body = r.json()
-        except json.JSONDecodeError:
-            raise PanelAPIError(f"Некорректный JSON ответа addClient (inbound {inbound_id}).")
-
-        if not body.get("success", False):
-            msg = body.get("msg", str(body))
-            logger.error("addClient failed inbound=%s: %s", inbound_id, msg)
-            raise PanelAPIError(f"Панель не создала клиента (inbound {inbound_id}): {msg}")
-
-    async def update_client(
+    async def _update_client_legacy(
         self,
         inbound_id: int,
         client_uuid: str,
         email: str,
         sub_id: str,
-        protocol: str = "",
-        expiry_time_ms: int = 0,
+        protocol: str,
+        expiry_time_ms: int,
     ) -> None:
-        """Обновляет существующего клиента во inbound (меняет expiryTime и т.п.).
-
-        Эндпоинт 3x-ui: POST /panel/api/inbounds/updateClient/<clientId>,
-        где clientId — UUID для vless/vmess или password для trojan (у нас это одно и то же,
-        см. _client_json_for_protocol → add_client).
-        """
-        client = self._require_client()
         client_row = self._client_json_for_protocol(
             protocol, client_uuid, email, sub_id, expiry_time_ms, inbound_id
         )
@@ -540,39 +516,10 @@ class PanelAPI:
             "settings": json.dumps(settings_obj, separators=(",", ":")),
         }
         path = f"panel/api/inbounds/updateClient/{client_uuid}"
-        r: httpx.Response | None = None
-        try:
-            for url in self._panel_api_urls(path):
-                r = await client.post(
-                    url,
-                    json=payload,
-                    headers=self._csrf_headers(),
-                )
-                if r.status_code != 404:
-                    break
-        except httpx.RequestError as e:
-            logger.exception("updateClient inbound=%s: %s", inbound_id, e)
-            raise PanelAPIError("Сеть: не удалось связаться с панелью.") from e
-        if r is None:
-            raise PanelAPIError("updateClient: нет ответа панели.")
-
-        logger.info(
-            "updateClient inbound=%s status=%s body=%s",
-            inbound_id,
-            r.status_code,
-            (r.text[:400] + "…") if len(r.text) > 400 else r.text,
+        r = await self._request_panel("POST", path, json_body=payload)
+        self._check_panel_json_response(
+            r, "inbounds/updateClient", f"inbound={inbound_id}"
         )
-
-        if r.status_code != 200:
-            raise PanelAPIError(f"Панель вернула HTTP {r.status_code} для inbound {inbound_id}.")
-        try:
-            body = r.json()
-        except json.JSONDecodeError:
-            raise PanelAPIError(f"Некорректный JSON ответа updateClient (inbound {inbound_id}).")
-        if not body.get("success", False):
-            msg = body.get("msg", str(body))
-            logger.error("updateClient failed inbound=%s: %s", inbound_id, msg)
-            raise PanelAPIError(f"Панель не обновила клиента (inbound {inbound_id}): {msg}")
 
     async def update_user_on_all_inbounds(
         self,
@@ -581,22 +528,15 @@ class PanelAPI:
         sub_id: str,
         expiry_time_ms: int,
     ) -> int:
-        """Продлевает клиента на инбаундах, где он есть на этой панели.
-
-        Пропускает отсутствующие на панели id из INBOUND_IDS и ошибки
-        update по отдельному inbound (нет клиента / отказ панели по одному id).
-
-        Возвращает число успешных update_client.
-        """
         await self.login()
         proto_map = await self._inbound_protocol_map()
-        inbound_ids = [iid for iid in INBOUND_IDS if iid in proto_map]
+        inbound_ids = self._target_inbound_ids(proto_map)
+
         if await self._uses_clients_api_v3():
-            if not inbound_ids:
-                return 0
+            email = panel_client_email(base_email, inbound_ids)
             try:
                 await self._update_client_v3(
-                    base_email,
+                    email,
                     client_uuid,
                     sub_id,
                     expiry_time_ms,
@@ -606,21 +546,17 @@ class PanelAPI:
                 return len(inbound_ids)
             except PanelAPIError as e:
                 logger.warning(
-                    "Продление v3 на панели %s для %s: %s",
+                    "Продление v3 (%s) на %s: %s — пробуем legacy email",
+                    email,
                     self._base,
-                    base_email,
                     e,
                 )
-                return 0
 
         ok = 0
-        for iid in INBOUND_IDS:
-            if iid not in proto_map:
-                logger.debug("Продление: inbound %s нет на панели, пропуск.", iid)
-                continue
+        for iid in inbound_ids:
             email = f"{base_email}_{iid}"
             try:
-                await self.update_client(
+                await self._update_client_legacy(
                     iid,
                     client_uuid,
                     email,
@@ -631,7 +567,7 @@ class PanelAPI:
                 ok += 1
             except PanelAPIError as e:
                 logger.warning(
-                    "Продление: не обновлён inbound %s на панели (%s): %s",
+                    "Продление: inbound %s на %s: %s",
                     iid,
                     self._base,
                     e,
@@ -646,11 +582,15 @@ class PanelAPI:
         expiry_time_ms: int | None = None,
     ) -> None:
         await self.login()
-        expiry_ms = expiry_time_ms if expiry_time_ms is not None else subscription_expiry_time_ms()
+        expiry_ms = (
+            expiry_time_ms
+            if expiry_time_ms is not None
+            else subscription_expiry_time_ms()
+        )
         proto_map = await self._inbound_protocol_map()
-        inbound_ids = [iid for iid in INBOUND_IDS if iid in proto_map]
+        inbound_ids = self._target_inbound_ids(proto_map)
         if not inbound_ids:
-            raise PanelAPIError("На панели нет ни одного из ожидаемых inbound.")
+            raise PanelAPIError("На панели нет inbound для выдачи доступа.")
 
         if await self._uses_clients_api_v3():
             await self._add_client_v3(
@@ -664,11 +604,10 @@ class PanelAPI:
             return
 
         for iid in inbound_ids:
-            email = f"{base_email}_{iid}"
-            await self.add_client(
+            await self._add_client_legacy(
                 iid,
                 client_uuid,
-                email,
+                f"{base_email}_{iid}",
                 sub_id,
                 proto_map.get(iid, ""),
                 expiry_ms,

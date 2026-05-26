@@ -21,3 +21,5 @@ jobs:
             cd /root/Tgbot
             git fetch --all
             git reset --hard origin/main
+            systemctl restart my_bot.service
+            systemctl is-active my_bot.service
