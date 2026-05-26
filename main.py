@@ -370,7 +370,6 @@ async def _refresh_sub_config() -> None:
             continue
         try:
             async with _panel_api(panel) as api:
-                await api.login()
                 cfg = await api.get_sub_config()
             if cfg:
                 panel.sub_config_cache = cfg
