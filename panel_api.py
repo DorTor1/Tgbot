@@ -1,4 +1,4 @@
-"""Клиент 3x-ui v3.x: логин, клиенты (/panel/api/clients/*), настройки подписки."""
+"""Клиент 3x-ui 3.x: Bearer или сессия, /panel/api/clients/*, настройки подписки."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Маркер сборки — ищите в journalctl после рестарта; если строки нет, крутится старый код.
-PANEL_API_BUILD = "v3-clients-2026-05-26"
+PANEL_API_BUILD = "v3-bearer-renew-2026-05-26"
 
 _DEFAULT_INBOUND_IDS = (1, 2, 3, 4)
 
@@ -89,24 +89,28 @@ class PanelAPIError(Exception):
 
 
 class PanelAPI:
-    """Клиент 3x-ui 3.x: CSRF, POST /panel/api/clients/add, GET /panel/api/inbounds/list."""
+    """Клиент 3x-ui 3.x: Bearer API token (предпочтительно) или login+CSRF."""
 
     _CSRF_HEADER = "X-CSRF-Token"
 
     def __init__(
         self,
         base_url: str,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
+        *,
+        api_token: str = "",
         timeout: float = 45.0,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._username = username
         self._password = password
+        self._api_token = api_token.strip()
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._csrf_token: str | None = None
         self._clients_api_v3: bool | None = None
+        self._logged_in = False
 
     def _abs_url(self, path: str) -> str:
         p = path.lstrip("/")
@@ -116,9 +120,18 @@ class PanelAPI:
         p = path.lstrip("/").rstrip("/")
         return f"{self._base}/{p}/", f"{self._base}/{p}"
 
+    def _uses_bearer(self) -> bool:
+        return bool(self._api_token)
+
     def _api_headers(self) -> dict[str, str]:
-        h = {"X-Requested-With": "XMLHttpRequest"}
-        h.update(self._csrf_headers())
+        h: dict[str, str] = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json",
+        }
+        if self._uses_bearer():
+            h["Authorization"] = f"Bearer {self._api_token}"
+        else:
+            h.update(self._csrf_headers())
         return h
 
     def _csrf_headers(self) -> dict[str, str]:
@@ -177,6 +190,7 @@ class PanelAPI:
         )
         self._csrf_token = None
         self._clients_api_v3 = None
+        self._logged_in = False
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -225,6 +239,18 @@ class PanelAPI:
             raise PanelAPIError("Вход в панель отклонён.")
 
         await self._fetch_panel_csrf_token()
+        self._logged_in = True
+
+    async def _ensure_auth(self) -> None:
+        """Bearer-токен не требует login; иначе — сессия и CSRF."""
+        if self._uses_bearer():
+            return
+        if not self._logged_in:
+            if not self._username or not self._password:
+                raise PanelAPIError(
+                    "Задайте PANEL_API_TOKEN или пару PANEL_LOGIN / PANEL_PASSWORD."
+                )
+            await self.login()
 
     async def _request_panel(
         self,
@@ -276,6 +302,7 @@ class PanelAPI:
 
     async def get_sub_config(self) -> dict[str, Any]:
         """Настройки подписки: POST /panel/setting/all (3x-ui 3.x)."""
+        await self._ensure_auth()
         r: httpx.Response | None = None
         last_status = 0
         for path in ("panel/setting/all", "panel/api/setting/all"):
@@ -395,6 +422,8 @@ class PanelAPI:
         expiry_time_ms: int,
         inbound_ids: list[int],
         proto_map: dict[int, str],
+        *,
+        telegram_id: int | None = None,
     ) -> dict[str, Any]:
         row: dict[str, Any] = {
             "email": email,
@@ -404,6 +433,8 @@ class PanelAPI:
             "limitIp": 0,
             "totalGB": 0,
         }
+        if telegram_id is not None and telegram_id > 0:
+            row["tgId"] = telegram_id
         protos = {(proto_map.get(i) or "").lower() for i in inbound_ids}
         if "trojan" in protos:
             row["password"] = client_uuid
@@ -422,11 +453,19 @@ class PanelAPI:
         expiry_time_ms: int,
         inbound_ids: list[int],
         proto_map: dict[int, str],
+        *,
+        telegram_id: int | None = None,
     ) -> None:
         email = panel_client_email(base_email, inbound_ids)
         payload = {
             "client": self._v3_client_body(
-                email, client_uuid, sub_id, expiry_time_ms, inbound_ids, proto_map
+                email,
+                client_uuid,
+                sub_id,
+                expiry_time_ms,
+                inbound_ids,
+                proto_map,
+                telegram_id=telegram_id,
             ),
             "inboundIds": inbound_ids,
         }
@@ -445,14 +484,143 @@ class PanelAPI:
         expiry_time_ms: int,
         inbound_ids: list[int],
         proto_map: dict[int, str],
+        *,
+        telegram_id: int | None = None,
     ) -> None:
         enc = quote(email, safe="")
         path = f"panel/api/clients/update/{enc}"
         payload = self._v3_client_body(
-            email, client_uuid, sub_id, expiry_time_ms, inbound_ids, proto_map
+            email,
+            client_uuid,
+            sub_id,
+            expiry_time_ms,
+            inbound_ids,
+            proto_map,
+            telegram_id=telegram_id,
         )
         r = await self._request_panel("POST", path, json_body=payload)
         self._check_panel_json_response(r, "clients/update", email)
+
+    async def _get_client_v3(
+        self, email: str
+    ) -> tuple[dict[str, Any], list[int]] | None:
+        enc = quote(email, safe="")
+        r = await self._request_panel("GET", f"panel/api/clients/get/{enc}")
+        if r.status_code == 404:
+            return None
+        self._check_panel_json_response(r, "clients/get", email)
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            return None
+        obj = body.get("obj")
+        if not isinstance(obj, dict):
+            return None
+        client = obj.get("client")
+        if not isinstance(client, dict):
+            client = obj
+        raw_ids = obj.get("inboundIds")
+        inbound_ids: list[int] = []
+        if isinstance(raw_ids, list):
+            for x in raw_ids:
+                try:
+                    inbound_ids.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+        return client, inbound_ids
+
+    async def _find_client_email_by_sub_id(self, sub_id: str) -> str | None:
+        q = quote(sub_id, safe="")
+        r = await self._request_panel(
+            "GET", f"panel/api/clients/list/paged?search={q}&pageSize=50"
+        )
+        if r.status_code != 200:
+            return None
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            return None
+        if not body.get("success"):
+            return None
+        obj = body.get("obj")
+        if not isinstance(obj, dict):
+            return None
+        items = obj.get("items")
+        if not isinstance(items, list):
+            return None
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            if row.get("subId") == sub_id:
+                em = row.get("email")
+                if isinstance(em, str) and em.strip():
+                    return em.strip()
+        return None
+
+    async def _attach_client_v3(self, email: str, inbound_ids: list[int]) -> None:
+        if not inbound_ids:
+            return
+        enc = quote(email, safe="")
+        path = f"panel/api/clients/{enc}/attach"
+        r = await self._request_panel(
+            "POST", path, json_body={"inboundIds": inbound_ids}
+        )
+        self._check_panel_json_response(
+            r, "clients/attach", f"email={email} inbounds={inbound_ids}"
+        )
+
+    async def _renew_client_v3(
+        self,
+        base_email: str,
+        client_uuid: str,
+        sub_id: str,
+        expiry_time_ms: int,
+        inbound_ids: list[int],
+        proto_map: dict[int, str],
+        *,
+        telegram_id: int | None = None,
+    ) -> set[int]:
+        """Продление через API v3: attach недостающих inbound + update."""
+        updated: set[int] = set()
+        candidates: list[str] = []
+        canonical = panel_client_email(base_email, inbound_ids)
+        candidates.append(canonical)
+        by_sub = await self._find_client_email_by_sub_id(sub_id)
+        if by_sub and by_sub not in candidates:
+            candidates.append(by_sub)
+
+        for email in candidates:
+            found = await self._get_client_v3(email)
+            if found is None:
+                continue
+            _, attached = found
+            missing = [i for i in inbound_ids if i not in attached]
+            if missing:
+                logger.info(
+                    "Продление v3: привязка %s к inbound %s на %s",
+                    email,
+                    missing,
+                    self._base,
+                )
+                await self._attach_client_v3(email, missing)
+            await self._update_client_v3(
+                email,
+                client_uuid,
+                sub_id,
+                expiry_time_ms,
+                inbound_ids,
+                proto_map,
+                telegram_id=telegram_id,
+            )
+            updated.update(inbound_ids)
+            logger.info(
+                "Продление v3: обновлён %s (все целевые inbound %s) на %s",
+                email,
+                inbound_ids,
+                self._base,
+            )
+            break
+        return updated
 
     @staticmethod
     def _client_json_for_protocol(
@@ -530,52 +698,68 @@ class PanelAPI:
         client_uuid: str,
         sub_id: str,
         expiry_time_ms: int,
+        *,
+        telegram_id: int | None = None,
     ) -> int:
-        await self.login()
+        """Продлевает клиента на всех inbound (v3 + legacy-записи со старых выдач)."""
+        await self._ensure_auth()
         proto_map = await self._inbound_protocol_map()
         inbound_ids = self._target_inbound_ids(proto_map)
+        updated_inbound_ids: set[int] = set()
 
         if await self._uses_clients_api_v3():
-            email = panel_client_email(base_email, inbound_ids)
             try:
-                await self._update_client_v3(
-                    email,
+                v3_done = await self._renew_client_v3(
+                    base_email,
                     client_uuid,
                     sub_id,
                     expiry_time_ms,
                     inbound_ids,
                     proto_map,
+                    telegram_id=telegram_id,
                 )
-                return len(inbound_ids)
+                updated_inbound_ids |= v3_done
             except PanelAPIError as e:
                 logger.warning(
-                    "Продление v3 (%s) на %s: %s — пробуем legacy email",
-                    email,
+                    "Продление v3 на %s: %s — продолжаем legacy по inbound",
                     self._base,
                     e,
                 )
 
-        ok = 0
         for iid in inbound_ids:
-            email = f"{base_email}_{iid}"
+            legacy_email = f"{base_email}_{iid}"
             try:
                 await self._update_client_legacy(
                     iid,
                     client_uuid,
-                    email,
+                    legacy_email,
                     sub_id,
                     proto_map.get(iid, ""),
                     expiry_time_ms,
                 )
-                ok += 1
-            except PanelAPIError as e:
-                logger.warning(
-                    "Продление: inbound %s на %s: %s",
+                updated_inbound_ids.add(iid)
+                logger.info(
+                    "Продление legacy: inbound %s (%s) на %s",
                     iid,
+                    legacy_email,
+                    self._base,
+                )
+            except PanelAPIError as e:
+                logger.debug(
+                    "Продление legacy: inbound %s (%s) на %s: %s",
+                    iid,
+                    legacy_email,
                     self._base,
                     e,
                 )
-        return ok
+
+        logger.info(
+            "Продление итог на %s: обновлены inbound %s из %s",
+            self._base,
+            sorted(updated_inbound_ids),
+            inbound_ids,
+        )
+        return len(updated_inbound_ids)
 
     async def register_user_on_all_inbounds(
         self,
@@ -583,8 +767,10 @@ class PanelAPI:
         client_uuid: str,
         sub_id: str,
         expiry_time_ms: int | None = None,
+        *,
+        telegram_id: int | None = None,
     ) -> None:
-        await self.login()
+        await self._ensure_auth()
         expiry_ms = (
             expiry_time_ms
             if expiry_time_ms is not None
@@ -612,6 +798,7 @@ class PanelAPI:
                 expiry_ms,
                 inbound_ids,
                 proto_map,
+                telegram_id=telegram_id,
             )
             return
 

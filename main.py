@@ -68,10 +68,24 @@ class PanelConfig:
     base_url: str
     login: str
     password: str
+    api_token: str = ""  # Settings → Security → API Token (предпочтительно)
     sub_base_url: str = ""
     sub_path: str = ""
     sub_query_param: str = "name"
     sub_config_cache: dict[str, Any] = field(default_factory=dict)
+
+
+def _panel_has_credentials(panel: PanelConfig) -> bool:
+    return bool(panel.api_token or (panel.login and panel.password))
+
+
+def _panel_api(panel: PanelConfig) -> PanelAPI:
+    return PanelAPI(
+        panel.base_url,
+        panel.login,
+        panel.password,
+        api_token=panel.api_token,
+    )
 
 
 def _env(name: str, default: str = "") -> str:
@@ -94,6 +108,7 @@ def _load_panels() -> list[PanelConfig]:
             continue
         login = _env(f"PANEL_LOGIN_{i}")
         password = _env(f"PANEL_PASSWORD_{i}")
+        api_token = _env(f"PANEL_API_TOKEN_{i}") or _env("PANEL_API_TOKEN")
         name = _env(f"PANEL_NAME_{i}") or f"Сервер {i}"
         sub_base = _env(f"SUBSCRIPTION_BASE_URL_{i}").rstrip("/")
         sub_path = _env(f"SUBSCRIPTION_PATH_{i}")
@@ -105,6 +120,7 @@ def _load_panels() -> list[PanelConfig]:
                 base_url=base_url,
                 login=login,
                 password=password,
+                api_token=api_token,
                 sub_base_url=sub_base,
                 sub_path=sub_path,
                 sub_query_param=sub_qp,
@@ -124,6 +140,7 @@ def _load_panels() -> list[PanelConfig]:
             base_url=base_url,
             login=_env("PANEL_LOGIN"),
             password=_env("PANEL_PASSWORD"),
+            api_token=_env("PANEL_API_TOKEN"),
             sub_base_url=_env("SUBSCRIPTION_BASE_URL").rstrip("/"),
             sub_path=_env("SUBSCRIPTION_PATH"),
             sub_query_param=_env("SUBSCRIPTION_QUERY_PARAM") or "name",
@@ -349,10 +366,10 @@ def _sub_token() -> str:
 async def _refresh_sub_config() -> None:
     """Читает актуальные настройки подписки для каждой панели и кладёт в её кэш."""
     for panel in PANELS:
-        if not panel.login or not panel.password or not panel.base_url:
+        if not panel.base_url or not _panel_has_credentials(panel):
             continue
         try:
-            async with PanelAPI(panel.base_url, panel.login, panel.password) as api:
+            async with _panel_api(panel) as api:
                 await api.login()
                 cfg = await api.get_sub_config()
             if cfg:
@@ -437,7 +454,7 @@ def _all_links(sub_token: str) -> list[tuple[str, str]]:
 
 
 def _panels_configured() -> bool:
-    return any(p.login and p.password and p.base_url for p in PANELS)
+    return any(p.base_url and _panel_has_credentials(p) for p in PANELS)
 
 
 def _greeting_name(user: User | None) -> str:
@@ -604,15 +621,16 @@ async def _create_subscription_for_user(
     # Регистрируем одного и того же клиента на всех сконфигурированных панелях.
     # Если хоть одна упадёт — считаем это ошибкой (выдать «половину» доступа не хочется).
     for panel in PANELS:
-        if not panel.login or not panel.password or not panel.base_url:
+        if not panel.base_url or not _panel_has_credentials(panel):
             continue
         try:
-            async with PanelAPI(panel.base_url, panel.login, panel.password) as api:
+            async with _panel_api(panel) as api:
                 await api.register_user_on_all_inbounds(
                     base_email,
                     client_uuid,
                     sub,
                     expiry_time_ms,
+                    telegram_id=tid,
                 )
         except PanelAPIError as e:
             logger.warning(
@@ -1096,15 +1114,16 @@ async def _extend_subscription_for_user(
     new_expiry_ms = expiry_time_ms_for_days(days)
     updated_inbounds = 0
     for panel in PANELS:
-        if not panel.login or not panel.password or not panel.base_url:
+        if not panel.base_url or not _panel_has_credentials(panel):
             continue
         try:
-            async with PanelAPI(panel.base_url, panel.login, panel.password) as api:
+            async with _panel_api(panel) as api:
                 n = await api.update_user_on_all_inbounds(
                     device.base_email,
                     device.uuid,
                     device.sub_token,
                     new_expiry_ms,
+                    telegram_id=tid,
                 )
                 updated_inbounds += n
                 if n == 0:
@@ -1475,14 +1494,14 @@ async def main() -> None:
         raise SystemExit("Укажите BOT_TOKEN в .env")
     if not PANELS:
         raise SystemExit(
-            "Укажите хотя бы одну панель: PANEL_BASE_URL_1 / PANEL_LOGIN_1 / PANEL_PASSWORD_1 "
-            "(или старые PANEL_BASE_URL / PANEL_LOGIN / PANEL_PASSWORD для одной панели)."
+            "Укажите хотя бы одну панель: PANEL_BASE_URL_1 и PANEL_API_TOKEN_1 "
+            "(или PANEL_LOGIN_1 / PANEL_PASSWORD_1; для одной панели — без суффикса _1)."
         )
     for p in PANELS:
-        if not p.login or not p.password:
+        if not _panel_has_credentials(p):
             raise SystemExit(
-                f"Для панели #{p.index} ({p.name}) не задан PANEL_LOGIN_{p.index} "
-                f"или PANEL_PASSWORD_{p.index}."
+                f"Для панели #{p.index} ({p.name}) задайте PANEL_API_TOKEN_{p.index} "
+                f"или пару PANEL_LOGIN_{p.index} / PANEL_PASSWORD_{p.index}."
             )
     logger.info(
         "Сконфигурировано панелей: %d — %s",
