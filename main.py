@@ -14,7 +14,7 @@ import string
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -25,6 +25,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     User,
 )
 from dotenv import load_dotenv
@@ -34,9 +35,9 @@ from panel_api import (
     PANEL_API_BUILD,
     PanelAPI,
     PanelAPIError,
+    build_subscription_link,
     expiry_time_ms_for_days,
     inbound_ids_config,
-    panel_api_mode,
     panel_client_email,
     subscription_days,
     subscription_expiry_time_ms,
@@ -93,14 +94,7 @@ def _env(name: str, default: str = "") -> str:
 
 
 def _load_panels() -> list[PanelConfig]:
-    """Считывает панели из .env.
-
-    Поддерживает два режима:
-      1. Несколько панелей через суффиксы: PANEL_BASE_URL_1, PANEL_LOGIN_1, ... PANEL_BASE_URL_2 ...
-         Плюс PANEL_NAME_1 (название для пользователя), SUBSCRIPTION_BASE_URL_1 / SUBSCRIPTION_PATH_1 /
-         SUBSCRIPTION_QUERY_PARAM_1 — опциональные override'ы подписки.
-      2. Fallback: одна панель из старых переменных без суффикса.
-    """
+    """Мастер-панель из .env: PANEL_BASE_URL_1 / PANEL_API_TOKEN_1 или без суффикса _1."""
     panels: list[PanelConfig] = []
     for i in range(1, 21):
         base_url = _env(f"PANEL_BASE_URL_{i}").rstrip("/")
@@ -150,33 +144,42 @@ def _load_panels() -> list[PanelConfig]:
 
 PANELS: list[PanelConfig] = _load_panels()
 
-# База URL объединённой подписки (агрегатор за nginx), без токена на конце.
-# Пример: https://sub.example.com:2096/sub → пользователю: .../sub/<sub_token>
-SUBSCRIPTION_AGGREGATOR_BASE = _env("SUBSCRIPTION_AGGREGATOR_BASE").rstrip("/")
+
+def _master_panel() -> PanelConfig | None:
+    """Мастер-панель 3x-ui: первая в .env; ноды (США и т.д.) синхронизирует сама панель."""
+    for panel in PANELS:
+        if panel.base_url and _panel_has_credentials(panel):
+            return panel
+    return None
+
+
+def _api_panels() -> list[PanelConfig]:
+    """Мастер-панель 3x-ui (ноды синхронизирует сама панель)."""
+    master = _master_panel()
+    return [master] if master else []
+
 
 # HTML-страница с инструкцией (репозиторий: index.html). Без ?name= на конце.
 # Пример: https://macbookairm4.mooo.com/Oab4HaruLF — бот добавит ?name=<sub_token>.
 # Страницу нужно отдавать nginx’ом с вашего index.html; иначе откроется портал 3x-ui.
 SUBSCRIPTION_PORTAL_BASE = _env("SUBSCRIPTION_PORTAL_BASE").rstrip("/")
 
-# Краткая инструкция в Telegram при выдаче объединённой подписки (агрегатор).
-SUBSCRIPTION_TG_INSTRUCTION_AGG = """📋 Как подключиться
-
-1. Установите клиент с поддержкой VLESS — например v2RayTun или Hiddify (iOS/Android), v2rayN / Hiddify (Windows), v2RayTun (macOS).
-
-2. В приложении выберите добавление подписки по ссылке (часто «Подписка по URL», «Import from URL» или вставка из буфера).
-
-3. Скопируйте ссылку из сообщения ниже и вставьте в клиент. Затем обновите список узлов — появятся серверы из обеих локаций в одном профиле.
-
-4. Выберите сервер в списке и включите подключение.
-
-Если ссылка не импортируется — скопируйте её целиком, без пробелов в начале и конце."""
-
 # Когда в .env задан SUBSCRIPTION_PORTAL_BASE — в Telegram короче (детали на странице).
 SUBSCRIPTION_TG_INSTRUCTION_PORTAL = (
     "📋 Откройте ссылку ниже в браузере: на странице инструкция под разные системы "
     "и кнопки импорта в клиенты."
 )
+
+# Мультиподписка 3x-ui 3.2+ (мастер + ноды в одной ссылке).
+SUBSCRIPTION_TG_INSTRUCTION_MULTISUB = """📋 Как подключиться
+
+1. Установите клиент с поддержкой подписок — v2RayTun, Hiddify, v2rayN и т.п.
+
+2. Добавьте подписку по ссылке из сообщения ниже («Подписка по URL» / Import from URL).
+
+3. Обновите список узлов — появятся серверы со всех локаций (мастер и подключённые ноды).
+
+4. Выберите узел и включите VPN."""
 
 
 def _subscription_portal_link(sub_token: str) -> str:
@@ -289,10 +292,10 @@ def _subscription_message_text(
             lines.append(SUBSCRIPTION_TG_INSTRUCTION_PORTAL)
             lines.append("")
             lines.append("Страница с инструкцией и подпиской:")
-        elif SUBSCRIPTION_AGGREGATOR_BASE:
-            lines.append(SUBSCRIPTION_TG_INSTRUCTION_AGG)
+        elif _master_panel() is not None:
+            lines.append(SUBSCRIPTION_TG_INSTRUCTION_MULTISUB)
             lines.append("")
-            lines.append("Ссылка на подписку (все серверы в одном профиле):")
+            lines.append("Ссылка на мультиподписку (все локации в одном профиле):")
         else:
             lines.append("Ссылка на подписку:")
         lines.append(links[0][1])
@@ -364,8 +367,8 @@ def _sub_token() -> str:
 
 
 async def _refresh_sub_config() -> None:
-    """Читает актуальные настройки подписки для каждой панели и кладёт в её кэш."""
-    for panel in PANELS:
+    """Читает настройки подписки с мастер-панели (для мультиподписки 3x-ui)."""
+    for panel in _api_panels():
         if not panel.base_url or not _panel_has_credentials(panel):
             continue
         if panel.sub_base_url and panel.sub_path:
@@ -391,79 +394,30 @@ async def _refresh_sub_config() -> None:
             )
 
 
-def _subscription_link_base_from_panel(panel: PanelConfig) -> str:
-    """Собирает базу ссылки подписки по настройкам конкретной панели."""
-    cfg = panel.sub_config_cache
-    sub_uri = (cfg.get("subURI") or "").strip() if isinstance(cfg, dict) else ""
-    if sub_uri:
-        return sub_uri.rstrip("/")
-
-    u = urlparse(panel.base_url)
-    sub_path = (cfg.get("subPath") if isinstance(cfg, dict) else None) or "/sub/"
-    sub_path = "/" + sub_path.strip("/")
-    sub_domain = (cfg.get("subDomain") if isinstance(cfg, dict) else None) or ""
-    sub_port = cfg.get("subPort") if isinstance(cfg, dict) else None
-    has_tls = bool(
-        (cfg.get("subKeyFile") if isinstance(cfg, dict) else None)
-        and (cfg.get("subCertFile") if isinstance(cfg, dict) else None)
-    )
-
-    host = sub_domain.strip() or (u.hostname or "")
-    if sub_domain:
-        scheme = "https" if has_tls else "http"
-    else:
-        scheme = u.scheme or ("https" if has_tls else "http")
-
-    try:
-        port_int = int(sub_port) if sub_port is not None else 0
-    except (TypeError, ValueError):
-        port_int = 0
-
-    netloc = host
-    if port_int and port_int not in (80, 443):
-        netloc = f"{host}:{port_int}"
-
-    return f"{scheme}://{netloc}{sub_path}".rstrip("/")
-
-
-def _subscription_link_base(panel: PanelConfig) -> str:
-    """База для ссылки подписки конкретной панели. Ручной override в .env сильнее, чем автодетект."""
-    if panel.sub_base_url and panel.sub_path:
-        root = panel.sub_base_url.rstrip("/")
-        path = panel.sub_path.strip("/")
-        return f"{root}/{path}" if path else root
-    if panel.sub_base_url and not panel.sub_path:
-        return panel.sub_base_url.rstrip("/")
-    if panel.sub_path:
-        u = urlparse(panel.base_url)
-        root = f"{u.scheme}://{u.netloc}".rstrip("/") if u.scheme and u.netloc else panel.base_url
-        return f"{root}/{panel.sub_path.strip('/')}"
-    return _subscription_link_base_from_panel(panel)
-
-
 def _instruction_link(panel: PanelConfig, sub_token: str) -> str:
-    base = _subscription_link_base(panel).rstrip("/")
-    enc = quote(sub_token, safe="")
-    q = panel.sub_query_param.lower()
-    if q in ("bare", "legacy", "none"):
-        return f"{base}?{enc}"
-    if q in ("path", "slash"):
-        return f"{base}/{enc}"
-    return f"{base}?{quote(panel.sub_query_param, safe='')}={enc}"
+    """Ссылка подписки с мастер-панели (включая ноды при мультиподписке 3x-ui)."""
+    return build_subscription_link(
+        sub_token,
+        panel_base_url=panel.base_url,
+        sub_config=panel.sub_config_cache,
+        sub_base_url=panel.sub_base_url,
+        sub_path=panel.sub_path,
+        sub_query_param=panel.sub_query_param,
+    )
 
 
 def _all_links(sub_token: str) -> list[tuple[str, str]]:
-    """Для sub_token — портал с инструкцией, прямая ссылка на агрегатор или по панели."""
+    """Мультиподписка с мастер-панели или HTML-портал из .env."""
     if SUBSCRIPTION_PORTAL_BASE:
         return [("Инструкция и подписка", _subscription_portal_link(sub_token))]
-    if SUBSCRIPTION_AGGREGATOR_BASE:
-        enc = quote(sub_token, safe="")
-        return [("Все серверы", f"{SUBSCRIPTION_AGGREGATOR_BASE}/{enc}")]
-    return [(p.name, _instruction_link(p, sub_token)) for p in PANELS]
+    master = _master_panel()
+    if master is not None:
+        return [(master.name, _instruction_link(master, sub_token))]
+    return []
 
 
 def _panels_configured() -> bool:
-    return any(p.base_url and _panel_has_credentials(p) for p in PANELS)
+    return _master_panel() is not None
 
 
 def _greeting_name(user: User | None) -> str:
@@ -476,14 +430,57 @@ def _greeting_name(user: User | None) -> str:
     return "друг"
 
 
-def _main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Получить доступ")],
-            [KeyboardButton(text="Мои подписки")],
-        ],
-        resize_keyboard=True,
+def _welcome_text(user: User | None) -> str:
+    name = _greeting_name(user)
+    approval_note = (
+        "\n\nЗаявку перед выдачей может подтвердить администратор — ссылка придёт в этот чат."
+        if _require_approval()
+        else ""
     )
+    return (
+        f"⚡️ Добро пожаловать, {name}, в Vibecode VPN!\n"
+        "Твой личный доступ к свободному интернету — быстрый, стабильный и честный.\n\n"
+        "Наши условия:\n\n"
+        "Цена: всего 80 руб / месяц.\n\n"
+        "Устройства: подключай любое количество гаджетов без доплат.\n\n"
+        "Трафик: комфортный объем для повседневного использования.\n\n"
+        "⚠️ Важное требование:\n\n"
+        "Для корректной работы сервиса обязательна настройка раздельного туннелирования "
+        "(Split Tunneling). Это позволит VPN работать только в нужных приложениях, "
+        "сохраняя высокую скорость для остальных."
+        f"{approval_note}\n\n"
+        "Готов начать?\n"
+        "Нажми кнопку ниже, чтобы получить конфиг и инструкцию по настройке."
+    )
+
+
+def _main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💳 Получить доступ", callback_data="menu_get_access"),
+            ],
+            [
+                InlineKeyboardButton(text="📱 Мои подписки", callback_data="menu_my_subs"),
+            ],
+        ]
+    )
+
+
+def _my_subs_keyboard(devices: list[db.UserDeviceRecord]) -> InlineKeyboardMarkup:
+    buttons = []
+    for d in devices:
+        label = _device_subscription_label_from_parts(d.device_kind, d.slot_index)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🔹 {label}",
+                callback_data=f"sub_view:{d.device_kind}:{d.slot_index}"
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _device_inline_keyboard() -> InlineKeyboardMarkup:
@@ -496,6 +493,9 @@ def _device_inline_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🖥 ПК", callback_data="dev:pc"),
                 InlineKeyboardButton(text="📟 Другое", callback_data="dev:other"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main"),
             ],
         ]
     )
@@ -528,6 +528,12 @@ def _terms_inline_keyboard() -> InlineKeyboardMarkup:
                     callback_data="terms:no",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад в меню",
+                    callback_data="menu_main",
+                ),
+            ],
         ]
     )
 
@@ -543,6 +549,12 @@ def _agreement_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="❌ Не согласен",
                     callback_data="agr:no",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад в меню",
+                    callback_data="menu_main",
                 ),
             ],
         ]
@@ -627,11 +639,10 @@ async def _create_subscription_for_user(
     expiry_time_ms = (
         expiry_time_ms_for_days(days) if days is not None else subscription_expiry_time_ms()
     )
-    # Регистрируем одного и того же клиента на всех сконфигурированных панелях.
-    # Если хоть одна упадёт — считаем это ошибкой (выдать «половину» доступа не хочется).
-    for panel in PANELS:
-        if not panel.base_url or not _panel_has_credentials(panel):
-            continue
+    api_panels = _api_panels()
+    if not api_panels:
+        return False, None, None, "Сейчас выдать ссылку нельзя. Напишите администратору."
+    for panel in api_panels:
         try:
             async with _panel_api(panel) as api:
                 await api.register_user_on_all_inbounds(
@@ -761,32 +772,22 @@ async def _subscription_reminder_worker(bot: Bot) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    name = _greeting_name(message.from_user)
-    approval_note = (
-        "\n\nЗаявку перед выдачей может подтвердить администратор — ссылка придёт в этот чат."
-        if _require_approval()
-        else ""
-    )
-    text = (
-        f"⚡️ Добро пожаловать, {name}, в Vibecode VPN!\n"
-        "Твой личный доступ к свободному интернету — быстрый, стабильный и честный.\n\n"
-        "Наши условия:\n\n"
-        "Цена: всего 80 руб / месяц.\n\n"
-        "Устройства: подключай любое количество гаджетов без доплат.\n\n"
-        "Трафик: комфортный объем для повседневного использования.\n\n"
-        "⚠️ Важное требование:\n\n"
-        "Для корректной работы сервиса обязательна настройка раздельного туннелирования "
-        "(Split Tunneling). Это позволит VPN работать только в нужных приложениях, "
-        "сохраняя высокую скорость для остальных."
-        f"{approval_note}\n\n"
-        "Готов начать?\n"
-        "Нажми кнопку ниже, чтобы получить конфиг и инструкцию по настройке."
-    )
+    # Очищаем Reply-клавиатуру, если она была у пользователя
+    msg = await message.answer("Запуск...", reply_markup=ReplyKeyboardRemove())
+    with suppress(Exception):
+        await msg.delete()
+
+    text = _welcome_text(message.from_user)
     await message.answer(text, reply_markup=_main_keyboard())
 
 
 @router.message(F.text == "Получить доступ")
-async def get_access(message: Message) -> None:
+async def get_access_text(message: Message) -> None:
+    # Очищаем Reply-клавиатуру, если она была у пользователя
+    msg = await message.answer("Очистка меню...", reply_markup=ReplyKeyboardRemove())
+    with suppress(Exception):
+        await msg.delete()
+
     if message.from_user is None:
         await message.answer("Что-то пошло не так. Попробуйте ещё раз.")
         return
@@ -798,13 +799,18 @@ async def get_access(message: Message) -> None:
         )
         return
 
-    if await db.get_access_request(message.from_user.id):
+    tid = message.from_user.id
+    if await db.get_access_request(tid):
         await message.answer(
-            "Мы уже получили вашу заявку. Ожидайте ответа."
+            "Мы уже получили вашу заявку. Ожидайте ответа.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                ]
+            )
         )
         return
 
-    tid = message.from_user.id
     if not await db.has_accepted_user_agreement(tid):
         await message.answer(
             LEGAL_TEXT,
@@ -819,6 +825,57 @@ async def get_access(message: Message) -> None:
     )
 
 
+@router.callback_query(F.data == "menu_main")
+async def cb_menu_main(query: CallbackQuery) -> None:
+    if query.message:
+        text = _welcome_text(query.from_user)
+        with suppress(Exception):
+            await query.message.edit_text(text, reply_markup=_main_keyboard())
+    await query.answer()
+
+
+@router.callback_query(F.data == "menu_get_access")
+async def cb_menu_get_access(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.message:
+        await query.answer()
+        return
+
+    tid = query.from_user.id
+    if not _panels_configured():
+        await query.answer("Сейчас выдать доступ нельзя. Напишите администратору.", show_alert=True)
+        return
+
+    if await db.get_access_request(tid):
+        with suppress(Exception):
+            await query.message.edit_text(
+                "Мы уже получили вашу заявку. Ожидайте ответа.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                    ]
+                )
+            )
+        await query.answer()
+        return
+
+    if not await db.has_accepted_user_agreement(tid):
+        with suppress(Exception):
+            await query.message.edit_text(
+                LEGAL_TEXT,
+                reply_markup=_agreement_inline_keyboard(),
+            )
+        await query.answer()
+        return
+
+    with suppress(Exception):
+        await query.message.edit_text(
+            _device_selection_text(),
+            reply_markup=_device_inline_keyboard(),
+            parse_mode="HTML",
+        )
+    await query.answer()
+
+
 @router.callback_query(F.data == "terms:yes")
 async def cb_terms_accept(query: CallbackQuery) -> None:
     if query.from_user is None:
@@ -828,12 +885,10 @@ async def cb_terms_accept(query: CallbackQuery) -> None:
     await query.answer("Правила приняты")
     if query.message:
         with suppress(Exception):
-            await query.message.delete()
-        await query.message.answer(
-            AGREEMENT_TEXT
-            + "\n\nЧтобы продолжить, подтвердите согласие с пользовательским соглашением — кнопки ниже.",
-            reply_markup=_agreement_inline_keyboard(),
-        )
+            await query.message.edit_text(
+                LEGAL_TEXT,
+                reply_markup=_agreement_inline_keyboard(),
+            )
 
 
 @router.callback_query(F.data == "terms:no")
@@ -843,14 +898,17 @@ async def cb_terms_decline(query: CallbackQuery) -> None:
         return
     await query.answer()
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await query.message.answer(
-            "Пока вы не примете правила, оформить подписку нельзя. "
-            "Когда будете готовы — снова нажмите «Получить доступ»."
-        )
+        with suppress(Exception):
+            await query.message.edit_text(
+                "Пока вы не примете правила, оформить подписку нельзя. "
+                "Когда будете готовы — вы сможете вернуться к соглашению.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Получить доступ", callback_data="menu_get_access")],
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                    ]
+                )
+            )
 
 
 @router.callback_query(F.data == "agr:yes")
@@ -864,12 +922,11 @@ async def cb_agreement_accept(query: CallbackQuery) -> None:
     await query.answer("Условия приняты")
     if query.message:
         with suppress(Exception):
-            await query.message.delete()
-        await query.message.answer(
-            _device_selection_text(),
-            reply_markup=_device_inline_keyboard(),
-            parse_mode="HTML",
-        )
+            await query.message.edit_text(
+                _device_selection_text(),
+                reply_markup=_device_inline_keyboard(),
+                parse_mode="HTML",
+            )
 
 
 @router.message(Command("admin_users"))
@@ -933,6 +990,7 @@ async def admin_user_info(message: Message) -> None:
         lines.append(f"   Срок: {expiry}")
         panel_email = panel_client_email(d.base_email, list(inbound_ids_config()))
         lines.append(f"   Email в панели: <code>{panel_email}</code>")
+        lines.append(f"   Telegram ID (tgId): <code>{target_tid}</code>")
         lines.append(f"   UUID: <code>{d.uuid}</code>\n")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
@@ -993,37 +1051,129 @@ async def cb_agreement_decline(query: CallbackQuery) -> None:
         return
     await query.answer()
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await query.message.answer(
-            "Без принятия условий использование Сервиса невозможно. "
-            "Если передумаете — нажмите «Получить доступ»."
-        )
+        with suppress(Exception):
+            await query.message.edit_text(
+                "Без принятия условий использование Сервиса невозможно. "
+                "Если передумаете — вы всегда можете принять их позже.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Получить доступ", callback_data="menu_get_access")],
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                    ]
+                )
+            )
 
 
 @router.message(F.text == "Мои подписки")
-async def my_subscriptions(message: Message) -> None:
+async def my_subscriptions_text(message: Message) -> None:
+    # Очищаем Reply-клавиатуру, если она была у пользователя
+    msg = await message.answer("Очистка меню...", reply_markup=ReplyKeyboardRemove())
+    with suppress(Exception):
+        await msg.delete()
+
     if message.from_user is None:
         return
-    devices = await db.list_user_devices(message.from_user.id)
+    tid = message.from_user.id
+    devices = await db.list_user_devices(tid)
     if not devices:
         await message.answer(
-            "Пока нет ссылок. Нажмите «Получить доступ», когда будете готовы."
+            "Пока нет ссылок. Нажмите «Получить доступ», когда будете готовы.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Получить доступ", callback_data="menu_get_access")],
+                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                ]
+            )
         )
         return
-    await message.answer(f"Ваши подписки ({len(devices)}):")
-    for d in devices:
-        text = _subscription_message_text(
-            _device_subscription_label_from_parts(d.device_kind, d.slot_index),
-            d.expiry_time_ms,
-            _all_links(d.sub_token),
+    await message.answer(
+        f"Ваши активные подписки ({len(devices)}):",
+        reply_markup=_my_subs_keyboard(devices),
+    )
+
+
+@router.callback_query(F.data == "menu_my_subs")
+async def cb_menu_my_subs(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.message:
+        await query.answer()
+        return
+    tid = query.from_user.id
+    devices = await db.list_user_devices(tid)
+    if not devices:
+        with suppress(Exception):
+            await query.message.edit_text(
+                "Пока нет ссылок. Нажмите «Получить доступ», когда будете готовы.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="💳 Получить доступ", callback_data="menu_get_access")],
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                    ]
+                )
+            )
+        await query.answer()
+        return
+
+    with suppress(Exception):
+        await query.message.edit_text(
+            f"Ваши активные подписки ({len(devices)}):",
+            reply_markup=_my_subs_keyboard(devices),
         )
-        await message.answer(
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("sub_view:"))
+async def cb_sub_view(query: CallbackQuery) -> None:
+    if query.from_user is None or not query.message:
+        await query.answer()
+        return
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.answer("Некорректные данные.", show_alert=True)
+        return
+    _, device_kind, slot_raw = parts
+    try:
+        slot_index = int(slot_raw)
+    except ValueError:
+        await query.answer("Некорректные данные.", show_alert=True)
+        return
+
+    tid = query.from_user.id
+    device = await db.get_user_device(tid, device_kind, slot_index)
+    if device is None:
+        await query.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    req = await db.get_renewal_request(tid, device_kind, slot_index)
+    renewal_note = ""
+    if req:
+        renewal_note = "⏳ Заявка на продление отправлена и ожидает одобрения администратора."
+
+    text = _subscription_message_text(
+        _device_subscription_label_from_parts(device_kind, slot_index),
+        device.expiry_time_ms,
+        _all_links(device.sub_token),
+        renewal_note=renewal_note,
+    )
+
+    buttons = []
+    if not req:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔁 Продлить",
+                callback_data=f"rnw_req:{device_kind}:{slot_index}",
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ К списку подписок", callback_data="menu_my_subs"),
+        InlineKeyboardButton(text="⬅️ В меню", callback_data="menu_main"),
+    ])
+
+    with suppress(Exception):
+        await query.message.edit_text(
             text,
-            reply_markup=_renew_device_keyboard(d.device_kind, d.slot_index),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
+    await query.answer()
 
 
 @router.callback_query(F.data.startswith("rnw_req:"))
@@ -1068,11 +1218,31 @@ async def cb_renewal_request(query: CallbackQuery, bot: Bot) -> None:
     if req is not None:
         await _notify_admins_renewal_request(bot, req)
 
-    await query.answer()
+    await query.answer("Заявка отправлена", show_alert=True)
     if query.message:
-        await query.message.answer(
-            "Заявка на продление отправлена. Администратор свяжется с вами по оплате."
-        )
+        # Если это было детальное окно подписки, мы можем обновить его
+        if "Ссылка на подписку" in (query.message.text or "") or "Ссылки на подписку" in (query.message.text or "") or "Страница с инструкцией" in (query.message.text or ""):
+            text = _subscription_message_text(
+                _device_subscription_label_from_parts(device_kind, slot_index),
+                device.expiry_time_ms,
+                _all_links(device.sub_token),
+                renewal_note="⏳ Заявка на продление отправлена и ожидает одобрения администратора. Администратор свяжется с вами по оплате.",
+            )
+            buttons = [
+                [
+                    InlineKeyboardButton(text="⬅️ К списку подписок", callback_data="menu_my_subs"),
+                    InlineKeyboardButton(text="⬅️ В меню", callback_data="menu_main"),
+                ]
+            ]
+            with suppress(Exception):
+                await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        else:
+            # Для других сообщений (например, автоматических напоминаний) просто дописываем статус
+            with suppress(Exception):
+                await query.message.edit_text(
+                    text=f"{query.message.text}\n\n⏳ Заявка на продление отправлена. Администратор свяжется с вами по оплате.",
+                    reply_markup=None
+                )
 
 
 async def _notify_admins_renewal_request(
@@ -1121,27 +1291,25 @@ async def _extend_subscription_for_user(
         return False, None, "Нет сконфигурированных панелей."
 
     new_expiry_ms = expiry_time_ms_for_days(days)
-    updated_inbounds = 0
-    for panel in PANELS:
-        if not panel.base_url or not _panel_has_credentials(panel):
-            continue
+    renewed = False
+    for panel in _api_panels():
         try:
             async with _panel_api(panel) as api:
-                n = await api.update_user_on_all_inbounds(
+                ok = await api.update_user_on_all_inbounds(
                     device.base_email,
                     device.uuid,
                     device.sub_token,
                     new_expiry_ms,
                     telegram_id=tid,
                 )
-                updated_inbounds += n
-                if n == 0:
-                    logger.info(
-                        "Продление: на панели %s (%s) для tg_id=%s ни один inbound "
-                        "не обновлён (нет совпадений или клиент отсутствует).",
+                if ok:
+                    renewed = True
+                else:
+                    logger.warning(
+                        "Продление: клиент subId=%s не найден на %s (%s)",
+                        device.sub_token,
                         panel.index,
                         panel.name,
-                        tid,
                     )
         except PanelAPIError as e:
             logger.warning(
@@ -1156,12 +1324,12 @@ async def _extend_subscription_for_user(
             )
             return False, None, f"Неожиданная ошибка на панели «{panel.name}»."
 
-    if updated_inbounds == 0:
+    if not renewed:
         return (
             False,
             None,
-            "Не удалось продлить: на доступных панелях нет клиента "
-            "ни в одном из ожидаемых inbound.",
+            "Не удалось продлить: клиент не найден на мастер-панели. "
+            "Проверьте PANEL_INBOUND_IDS и что подписка выдавалась после переустановки панели.",
         )
 
     await db.extend_device_expiry(tid, device_kind, slot_index, new_expiry_ms)
@@ -1214,18 +1382,22 @@ async def cb_renewal_approve(query: CallbackQuery, bot: Bot) -> None:
                 f"Новый срок: {_format_expiry_time_ms(new_expiry_ms)}\n\n"
                 "Ссылка на подписку остаётся прежней — ничего перенастраивать не нужно."
             ),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 Мои подписки", callback_data="menu_my_subs")]
+                ]
+            )
         )
     except Exception:
         logger.exception("Не удалось уведомить пользователя %s о продлении", tid)
 
     if query.message:
+        status_text = f"\n\n✅ <b>Продлено на {days} дн. до {_format_expiry_time_ms(new_expiry_ms)}</b>"
         with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        with suppress(Exception):
-            await query.message.reply(
-                f"Продлено пользователю <code>{tid}</code> на {days} дн. "
-                f"до {_format_expiry_time_ms(new_expiry_ms)}.",
-                parse_mode="HTML",
+            await query.message.edit_text(
+                text=(query.message.html_text or "") + status_text,
+                reply_markup=None,
+                parse_mode="HTML"
             )
 
 
@@ -1268,15 +1440,16 @@ async def cb_renewal_reject(query: CallbackQuery, bot: Bot) -> None:
         logger.exception("Не удалось уведомить пользователя %s об отказе в продлении", tid)
 
     if query.message:
+        status_text = f"\n\n❌ <b>Запрос на продление отклонён</b>"
         with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        with suppress(Exception):
-            await query.message.reply(
-                f"Отказ в продлении пользователю <code>{tid}</code>.",
-                parse_mode="HTML",
+            await query.message.edit_text(
+                text=(query.message.html_text or "") + status_text,
+                reply_markup=None,
+                parse_mode="HTML"
             )
 
 
+@router.callback_query(F.data.startswith("dev:"))
 @router.callback_query(F.data.startswith("dev:"))
 async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
     if query.from_user is None:
@@ -1330,13 +1503,15 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
         if req:
             await _notify_admins_new_request(bot, req)
         if query.message:
-            try:
-                await query.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await query.message.answer(
-                "Заявка отправлена. Когда её одобрят, ссылка на подписку придёт в этот чат."
-            )
+            with suppress(Exception):
+                await query.message.edit_text(
+                    "Заявка отправлена. Когда её одобрят, ссылка на подписку придёт в этот чат.",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                        ]
+                    )
+                )
         await query.answer()
         return
 
@@ -1347,21 +1522,24 @@ async def cb_device_chosen(query: CallbackQuery, bot: Bot) -> None:
     if not ok or sub is None or expiry_time_ms is None:
         await query.answer((err or "Ошибка")[:200], show_alert=True)
         return
-    if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
     links = _all_links(sub)
     if query.message:
         label = _device_subscription_label_from_parts(kind, slot_index)
-        await query.message.answer(
-            _subscription_message_text(
-                label,
-                expiry_time_ms,
-                links,
-            )
+        text = _subscription_message_text(
+            label,
+            expiry_time_ms,
+            links,
         )
+        with suppress(Exception):
+            await query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📱 Мои подписки", callback_data="menu_my_subs")],
+                        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu_main")]
+                    ]
+                )
+            )
     await query.answer("Готово")
 
 
@@ -1415,30 +1593,32 @@ async def cb_approve_access(query: CallbackQuery, bot: Bot) -> None:
     )
     delivered = False
     try:
-        await bot.send_message(tid, user_text)
+        await bot.send_message(
+            tid,
+            user_text,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 Мои подписки", callback_data="menu_my_subs")]
+                ]
+            )
+        )
         delivered = True
     except Exception:
         logger.exception("Не удалось написать пользователю %s", tid)
 
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        try:
-            if delivered:
-                await query.message.reply(
-                    f"Выдано пользователю <code>{tid}</code>.", parse_mode="HTML"
-                )
-            else:
-                await query.message.reply(
-                    f"Клиенты для <code>{tid}</code> созданы, в личку не доставлено "
-                    f"(нужен чат с ботом). Ссылки:\n"
-                    + "\n".join(f"{n}: {l}" for n, l in links),
-                    parse_mode="HTML",
-                )
-        except Exception:
-            pass
+        status_text = (
+            f"\n\n✅ <b>Выдано пользователю <code>{tid}</code></b>"
+            if delivered
+            else f"\n\n⚠️ <b>Создано для <code>{tid}</code>, но не доставлено в ЛС (нужен чат с ботом)</b>\n"
+                 + "\n".join(f"{n}: {l}" for n, l in links)
+        )
+        with suppress(Exception):
+            await query.message.edit_text(
+                text=(query.message.html_text or "") + status_text,
+                reply_markup=None,
+                parse_mode="HTML"
+            )
 
 
 @router.callback_query(F.data.startswith("rej:"))
@@ -1469,16 +1649,13 @@ async def cb_reject_access(query: CallbackQuery, bot: Bot) -> None:
         logger.exception("Не удалось уведомить пользователя %s об отказе", tid)
 
     if query.message:
-        try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        try:
-            await query.message.reply(
-                f"Отказ пользователю <code>{tid}</code>.", parse_mode="HTML"
+        status_text = f"\n\n❌ <b>Заявка пользователя <code>{tid}</code> отклонена</b>"
+        with suppress(Exception):
+            await query.message.edit_text(
+                text=(query.message.html_text or "") + status_text,
+                reply_markup=None,
+                parse_mode="HTML"
             )
-        except Exception:
-            pass
 
 
 @router.message(Command("stats"))
@@ -1512,25 +1689,31 @@ async def main() -> None:
                 f"Для панели #{p.index} ({p.name}) задайте PANEL_API_TOKEN_{p.index} "
                 f"или пару PANEL_LOGIN_{p.index} / PANEL_PASSWORD_{p.index}."
             )
-    logger.info(
-        "Сконфигурировано панелей: %d — %s",
-        len(PANELS),
-        ", ".join(f"#{p.index} {p.name} ({p.base_url})" for p in PANELS),
-    )
+    master = _master_panel()
+    if master:
+        logger.info(
+            "Панель: #%s %s (%s), API /panel/api/clients/*",
+            master.index,
+            master.name,
+            master.base_url,
+        )
+    if len(PANELS) > 1:
+        ignored = [p for p in PANELS if p is not master]
+        logger.warning(
+            "В .env указано несколько панелей; используется только #%s. "
+            "Лишние записи можно убрать: %s",
+            master.index if master else "?",
+            ", ".join(f"#{p.index} {p.name}" for p in ignored),
+        )
     if SUBSCRIPTION_PORTAL_BASE:
         logger.info(
             "Ссылки на подписку: HTML-портал %s?name=<sub_token>",
             SUBSCRIPTION_PORTAL_BASE,
         )
-    elif SUBSCRIPTION_AGGREGATOR_BASE:
+    elif master:
         logger.info(
-            "Ссылки на подписку: агрегатор %s/<sub_token>",
-            SUBSCRIPTION_AGGREGATOR_BASE,
-        )
-    else:
-        logger.info(
-            "Ссылки на подписку: отдельный URL с каждой панели "
-            "(нет SUBSCRIPTION_PORTAL_BASE и SUBSCRIPTION_AGGREGATOR_BASE)."
+            "Ссылки на подписку: мультиподписка с мастер-панели #%s (subId из 3x-ui)",
+            master.index,
         )
 
     await db.init_db()
@@ -1543,11 +1726,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     reminder_task = asyncio.create_task(_subscription_reminder_worker(bot))
-    logger.info(
-        "Бот запущен (panel_api build=%s, PANEL_API_MODE=%s)",
-        PANEL_API_BUILD,
-        panel_api_mode(),
-    )
+    logger.info("Бот запущен (panel_api build=%s)", PANEL_API_BUILD)
     try:
         await dp.start_polling(bot)
     finally:

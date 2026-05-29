@@ -7,14 +7,14 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 # Маркер сборки — ищите в journalctl после рестарта; если строки нет, крутится старый код.
-PANEL_API_BUILD = "v3-bearer-renew-2026-05-26"
+PANEL_API_BUILD = "v3-only-2026-05-29"
 
 _DEFAULT_INBOUND_IDS = (1, 2, 3, 4)
 
@@ -51,12 +51,10 @@ def expiry_time_ms_for_days(days: int) -> int:
     return int(end.timestamp() * 1000)
 
 
-def panel_api_mode() -> str:
-    """Режим API: v3 (3x-ui 3.x, по умолчанию), legacy (2.x), auto (определить)."""
-    v = os.getenv("PANEL_API_MODE", "v3").strip().lower()
-    if v in ("v3", "legacy", "auto"):
-        return v
-    return "v3"
+def panel_set_telegram_id() -> bool:
+    """Заполнять tgId в карточке клиента 3x-ui (Telegram ID пользователя бота)."""
+    v = os.getenv("PANEL_SET_TELEGRAM_ID", "1").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
 
 
 def inbound_ids_config() -> tuple[int, ...]:
@@ -77,11 +75,67 @@ def inbound_ids_config() -> tuple[int, ...]:
 
 
 def panel_client_email(base_email: str, inbound_ids: list[int] | None = None) -> str:
-    """Канонический email клиента в 3x-ui v3 (один на все inbound)."""
-    ids = inbound_ids or list(inbound_ids_config())
-    if not ids:
-        return base_email
-    return f"{base_email}_{min(ids)}"
+    """Email клиента в 3x-ui (одна запись на все inbound)."""
+    del inbound_ids  # единый email; inbound задаются отдельно
+    return base_email
+
+
+def build_subscription_link(
+    sub_id: str,
+    *,
+    panel_base_url: str,
+    sub_config: dict[str, Any] | None = None,
+    sub_base_url: str = "",
+    sub_path: str = "",
+    sub_query_param: str = "name",
+) -> str:
+    """Ссылка мультиподписки 3x-ui (мастер + ноды) по subId клиента."""
+    cfg = sub_config if isinstance(sub_config, dict) else {}
+    enc = quote(sub_id, safe="")
+
+    if sub_base_url and sub_path:
+        root = sub_base_url.rstrip("/")
+        path = sub_path.strip("/")
+        base = f"{root}/{path}" if path else root
+    elif sub_base_url:
+        base = sub_base_url.rstrip("/")
+    elif sub_path:
+        u = urlparse(panel_base_url)
+        root = f"{u.scheme}://{u.netloc}".rstrip("/") if u.scheme and u.netloc else panel_base_url
+        base = f"{root}/{sub_path.strip('/')}"
+    else:
+        sub_uri = (cfg.get("subURI") or "").strip()
+        if sub_uri:
+            base = sub_uri.rstrip("/")
+        else:
+            u = urlparse(panel_base_url)
+            sub_path_cfg = (cfg.get("subPath") if cfg else None) or "/sub/"
+            sub_path_cfg = "/" + str(sub_path_cfg).strip("/")
+            sub_domain = (cfg.get("subDomain") if cfg else None) or ""
+            sub_port = cfg.get("subPort") if cfg else None
+            has_tls = bool(
+                (cfg.get("subKeyFile") if cfg else None)
+                and (cfg.get("subCertFile") if cfg else None)
+            )
+            host = sub_domain.strip() or (u.hostname or "")
+            scheme = (
+                "https" if has_tls else "http"
+            ) if sub_domain else (u.scheme or ("https" if has_tls else "http"))
+            try:
+                port_int = int(sub_port) if sub_port is not None else 0
+            except (TypeError, ValueError):
+                port_int = 0
+            netloc = host
+            if port_int and port_int not in (80, 443):
+                netloc = f"{host}:{port_int}"
+            base = f"{scheme}://{netloc}{sub_path_cfg}".rstrip("/")
+
+    q = (sub_query_param or "name").lower()
+    if q in ("bare", "legacy", "none"):
+        return f"{base}?{enc}"
+    if q in ("path", "slash"):
+        return f"{base}/{enc}"
+    return f"{base}?{quote(sub_query_param, safe='')}={enc}"
 
 
 class PanelAPIError(Exception):
@@ -109,7 +163,6 @@ class PanelAPI:
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._csrf_token: str | None = None
-        self._clients_api_v3: bool | None = None
         self._logged_in = False
 
     def _abs_url(self, path: str) -> str:
@@ -189,7 +242,6 @@ class PanelAPI:
             follow_redirects=True,
         )
         self._csrf_token = None
-        self._clients_api_v3 = None
         self._logged_in = False
         return self
 
@@ -207,12 +259,26 @@ class PanelAPI:
         client = self._require_client()
         await self._fetch_public_csrf_token()
         login_url = self._abs_url("login")
+        login_body = {
+            "username": self._username,
+            "password": self._password,
+            "twoFactorCode": "",
+        }
         try:
             r = await client.post(
                 login_url,
-                data={"username": self._username, "password": self._password},
+                json=login_body,
                 headers=self._api_headers(),
             )
+            if r.status_code == 400:
+                r = await client.post(
+                    login_url,
+                    data={
+                        "username": self._username,
+                        "password": self._password,
+                    },
+                    headers=self._api_headers(),
+                )
         except httpx.RequestError as e:
             logger.exception("Панель недоступна при логине: %s", e)
             raise PanelAPIError("Панель недоступна. Попробуйте позже.") from e
@@ -394,35 +460,20 @@ class PanelAPI:
             return chosen
         return sorted(available)
 
-    async def _uses_clients_api_v3(self) -> bool:
-        if self._clients_api_v3 is not None:
-            return self._clients_api_v3
-        mode = panel_api_mode()
-        if mode == "v3":
-            self._clients_api_v3 = True
-            logger.info("Панель %s: режим API v3 (3x-ui 3.x)", self._base)
-            return True
-        if mode == "legacy":
-            self._clients_api_v3 = False
-            logger.info("Панель %s: режим legacy API (2.x)", self._base)
-            return False
+    @staticmethod
+    def _apply_telegram_id(
+        row: dict[str, Any], telegram_id: int | None
+    ) -> None:
+        if not panel_set_telegram_id() or telegram_id is None:
+            return
         try:
-            r = await self._request_panel("GET", "panel/api/clients/list")
-            body = r.json()
-            found = r.status_code == 200 and bool(body.get("success"))
-        except (PanelAPIError, json.JSONDecodeError):
-            found = False
-        self._clients_api_v3 = found
-        logger.info(
-            "Панель %s: %s",
-            self._base,
-            "API v3 (/panel/api/clients/*)"
-            if found
-            else "legacy (/panel/api/inbounds/addClient)",
-        )
-        return found
+            tid = int(telegram_id)
+        except (TypeError, ValueError):
+            return
+        if tid != 0:
+            row["tgId"] = tid
 
-    def _v3_client_body(
+    def _client_body(
         self,
         email: str,
         client_uuid: str,
@@ -432,6 +483,7 @@ class PanelAPI:
         proto_map: dict[int, str],
         *,
         telegram_id: int | None = None,
+        existing: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         row: dict[str, Any] = {
             "email": email,
@@ -441,19 +493,36 @@ class PanelAPI:
             "limitIp": 0,
             "totalGB": 0,
         }
-        if telegram_id is not None and telegram_id > 0:
-            row["tgId"] = telegram_id
+        if isinstance(existing, dict):
+            for key in (
+                "comment",
+                "reset",
+                "limitIp",
+                "totalGB",
+                "id",
+                "password",
+                "flow",
+            ):
+                if key in existing and existing[key] not in (None, ""):
+                    row[key] = existing[key]
+        self._apply_telegram_id(row, telegram_id)
         protos = {(proto_map.get(i) or "").lower() for i in inbound_ids}
         if "trojan" in protos:
             row["password"] = client_uuid
         if "trojan" not in protos or len(protos) > 1:
             row["id"] = client_uuid
+        # В v3 один клиент на все inbound: flow на записи попадает и в trojan,
+        # а Xray отказывается стартовать (Flow for Trojan has been removed).
         flow_iid = vless_flow_inbound_id()
-        if flow_iid in inbound_ids and (proto_map.get(flow_iid) or "").lower() == "vless":
+        if (
+            "trojan" not in protos
+            and flow_iid in inbound_ids
+            and (proto_map.get(flow_iid) or "").lower() == "vless"
+        ):
             row["flow"] = vless_flow_value()
         return row
 
-    async def _add_client_v3(
+    async def _add_client(
         self,
         base_email: str,
         client_uuid: str,
@@ -466,7 +535,7 @@ class PanelAPI:
     ) -> None:
         email = panel_client_email(base_email, inbound_ids)
         payload = {
-            "client": self._v3_client_body(
+            "client": self._client_body(
                 email,
                 client_uuid,
                 sub_id,
@@ -480,11 +549,12 @@ class PanelAPI:
         r = await self._request_panel(
             "POST", "panel/api/clients/add", json_body=payload
         )
-        self._check_panel_json_response(
-            r, "clients/add", f"email={email} inbounds={inbound_ids}"
-        )
+        detail = f"email={email} inbounds={inbound_ids}"
+        if "tgId" in payload["client"]:
+            detail += f" tgId={payload['client']['tgId']}"
+        self._check_panel_json_response(r, "clients/add", detail)
 
-    async def _update_client_v3(
+    async def _update_client(
         self,
         email: str,
         client_uuid: str,
@@ -497,7 +567,11 @@ class PanelAPI:
     ) -> None:
         enc = quote(email, safe="")
         path = f"panel/api/clients/update/{enc}"
-        payload = self._v3_client_body(
+        existing: dict[str, Any] | None = None
+        found = await self._get_client(email)
+        if found is not None:
+            existing, _ = found
+        payload = self._client_body(
             email,
             client_uuid,
             sub_id,
@@ -505,11 +579,15 @@ class PanelAPI:
             inbound_ids,
             proto_map,
             telegram_id=telegram_id,
+            existing=existing,
         )
         r = await self._request_panel("POST", path, json_body=payload)
-        self._check_panel_json_response(r, "clients/update", email)
+        detail = email
+        if "tgId" in payload:
+            detail += f" tgId={payload['tgId']}"
+        self._check_panel_json_response(r, "clients/update", detail)
 
-    async def _get_client_v3(
+    async def _get_client(
         self, email: str
     ) -> tuple[dict[str, Any], list[int]] | None:
         enc = quote(email, safe="")
@@ -540,7 +618,8 @@ class PanelAPI:
     async def _find_client_email_by_sub_id(self, sub_id: str) -> str | None:
         q = quote(sub_id, safe="")
         r = await self._request_panel(
-            "GET", f"panel/api/clients/list/paged?search={q}&pageSize=50"
+            "GET",
+            f"panel/api/clients/list/paged?page=1&pageSize=50&search={q}",
         )
         if r.status_code != 200:
             return None
@@ -565,7 +644,7 @@ class PanelAPI:
                     return em.strip()
         return None
 
-    async def _attach_client_v3(self, email: str, inbound_ids: list[int]) -> None:
+    async def _attach_client(self, email: str, inbound_ids: list[int]) -> None:
         if not inbound_ids:
             return
         enc = quote(email, safe="")
@@ -577,7 +656,7 @@ class PanelAPI:
             r, "clients/attach", f"email={email} inbounds={inbound_ids}"
         )
 
-    async def _renew_client_v3(
+    async def _renew_client(
         self,
         base_email: str,
         client_uuid: str,
@@ -588,7 +667,7 @@ class PanelAPI:
         *,
         telegram_id: int | None = None,
     ) -> set[int]:
-        """Продление через API v3: attach недостающих inbound + update."""
+        """Продление: attach недостающих inbound + update клиента."""
         updated: set[int] = set()
         candidates: list[str] = []
         canonical = panel_client_email(base_email, inbound_ids)
@@ -598,20 +677,20 @@ class PanelAPI:
             candidates.append(by_sub)
 
         for email in candidates:
-            found = await self._get_client_v3(email)
+            found = await self._get_client(email)
             if found is None:
                 continue
             _, attached = found
             missing = [i for i in inbound_ids if i not in attached]
             if missing:
                 logger.info(
-                    "Продление v3: привязка %s к inbound %s на %s",
+                    "Продление: привязка %s к inbound %s на %s",
                     email,
                     missing,
                     self._base,
                 )
-                await self._attach_client_v3(email, missing)
-            await self._update_client_v3(
+                await self._attach_client(email, missing)
+            await self._update_client(
                 email,
                 client_uuid,
                 sub_id,
@@ -622,83 +701,13 @@ class PanelAPI:
             )
             updated.update(inbound_ids)
             logger.info(
-                "Продление v3: обновлён %s (все целевые inbound %s) на %s",
+                "Продление: обновлён %s (inbound %s) на %s",
                 email,
                 inbound_ids,
                 self._base,
             )
             break
         return updated
-
-    @staticmethod
-    def _client_json_for_protocol(
-        protocol: str,
-        client_uuid: str,
-        email: str,
-        sub_id: str,
-        expiry_time_ms: int,
-        inbound_id: int,
-    ) -> dict[str, Any]:
-        proto = (protocol or "").strip().lower()
-        common = {
-            "email": email,
-            "subId": sub_id,
-            "enable": True,
-            "expiryTime": expiry_time_ms,
-        }
-        if proto == "trojan":
-            return {"password": client_uuid, **common}
-        row: dict[str, Any] = {"id": client_uuid, **common}
-        if inbound_id == vless_flow_inbound_id() and proto == "vless":
-            row["flow"] = vless_flow_value()
-        return row
-
-    async def _add_client_legacy(
-        self,
-        inbound_id: int,
-        client_uuid: str,
-        email: str,
-        sub_id: str,
-        protocol: str,
-        expiry_time_ms: int,
-    ) -> None:
-        client_row = self._client_json_for_protocol(
-            protocol, client_uuid, email, sub_id, expiry_time_ms, inbound_id
-        )
-        settings_obj = {"clients": [client_row]}
-        payload = {
-            "id": inbound_id,
-            "settings": json.dumps(settings_obj, separators=(",", ":")),
-        }
-        r = await self._request_panel(
-            "POST", "panel/api/inbounds/addClient", json_body=payload
-        )
-        self._check_panel_json_response(
-            r, "inbounds/addClient", f"inbound={inbound_id}"
-        )
-
-    async def _update_client_legacy(
-        self,
-        inbound_id: int,
-        client_uuid: str,
-        email: str,
-        sub_id: str,
-        protocol: str,
-        expiry_time_ms: int,
-    ) -> None:
-        client_row = self._client_json_for_protocol(
-            protocol, client_uuid, email, sub_id, expiry_time_ms, inbound_id
-        )
-        settings_obj = {"clients": [client_row]}
-        payload = {
-            "id": inbound_id,
-            "settings": json.dumps(settings_obj, separators=(",", ":")),
-        }
-        path = f"panel/api/inbounds/updateClient/{client_uuid}"
-        r = await self._request_panel("POST", path, json_body=payload)
-        self._check_panel_json_response(
-            r, "inbounds/updateClient", f"inbound={inbound_id}"
-        )
 
     async def update_user_on_all_inbounds(
         self,
@@ -708,66 +717,36 @@ class PanelAPI:
         expiry_time_ms: int,
         *,
         telegram_id: int | None = None,
-    ) -> int:
-        """Продлевает клиента на всех inbound (v3 + legacy-записи со старых выдач)."""
+    ) -> bool:
+        """Продлевает v3-клиента на мастер-панели (все inbound + синхронизация на ноды)."""
         await self._ensure_auth()
         proto_map = await self._inbound_protocol_map()
         inbound_ids = self._target_inbound_ids(proto_map)
-        updated_inbound_ids: set[int] = set()
+        if not inbound_ids:
+            raise PanelAPIError("На панели нет inbound для продления.")
 
-        if await self._uses_clients_api_v3():
-            try:
-                v3_done = await self._renew_client_v3(
-                    base_email,
-                    client_uuid,
-                    sub_id,
-                    expiry_time_ms,
-                    inbound_ids,
-                    proto_map,
-                    telegram_id=telegram_id,
-                )
-                updated_inbound_ids |= v3_done
-            except PanelAPIError as e:
-                logger.warning(
-                    "Продление v3 на %s: %s — продолжаем legacy по inbound",
-                    self._base,
-                    e,
-                )
-
-        for iid in inbound_ids:
-            legacy_email = f"{base_email}_{iid}"
-            try:
-                await self._update_client_legacy(
-                    iid,
-                    client_uuid,
-                    legacy_email,
-                    sub_id,
-                    proto_map.get(iid, ""),
-                    expiry_time_ms,
-                )
-                updated_inbound_ids.add(iid)
-                logger.info(
-                    "Продление legacy: inbound %s (%s) на %s",
-                    iid,
-                    legacy_email,
-                    self._base,
-                )
-            except PanelAPIError as e:
-                logger.debug(
-                    "Продление legacy: inbound %s (%s) на %s: %s",
-                    iid,
-                    legacy_email,
-                    self._base,
-                    e,
-                )
-
-        logger.info(
-            "Продление итог на %s: обновлены inbound %s из %s",
-            self._base,
-            sorted(updated_inbound_ids),
+        updated = await self._renew_client(
+            base_email,
+            client_uuid,
+            sub_id,
+            expiry_time_ms,
             inbound_ids,
+            proto_map,
+            telegram_id=telegram_id,
         )
-        return len(updated_inbound_ids)
+        if updated:
+            logger.info(
+                "Продление на %s: клиент обновлён, inbound %s",
+                self._base,
+                sorted(updated),
+            )
+            return True
+        logger.warning(
+            "Продление: клиент subId=%s не найден на %s",
+            sub_id,
+            self._base,
+        )
+        return False
 
     async def register_user_on_all_inbounds(
         self,
@@ -789,36 +768,19 @@ class PanelAPI:
         if not inbound_ids:
             raise PanelAPIError("На панели нет inbound для выдачи доступа.")
 
-        use_v3 = await self._uses_clients_api_v3()
         logger.info(
-            "register_user_on_all_inbounds: build=%s mode=%s v3=%s base=%s inbounds=%s",
+            "register_user: build=%s base=%s inbounds=%s email=%s",
             PANEL_API_BUILD,
-            panel_api_mode(),
-            use_v3,
             self._base,
             inbound_ids,
+            panel_client_email(base_email, inbound_ids),
         )
-        if use_v3:
-            await self._add_client_v3(
-                base_email,
-                client_uuid,
-                sub_id,
-                expiry_ms,
-                inbound_ids,
-                proto_map,
-                telegram_id=telegram_id,
-            )
-            return
-
-        logger.warning(
-            "register_user: legacy addClient (проверьте PANEL_API_MODE и что на сервере актуальный panel_api.py)"
+        await self._add_client(
+            base_email,
+            client_uuid,
+            sub_id,
+            expiry_ms,
+            inbound_ids,
+            proto_map,
+            telegram_id=telegram_id,
         )
-        for iid in inbound_ids:
-            await self._add_client_legacy(
-                iid,
-                client_uuid,
-                f"{base_email}_{iid}",
-                sub_id,
-                proto_map.get(iid, ""),
-                expiry_ms,
-            )

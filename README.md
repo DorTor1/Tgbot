@@ -1,84 +1,65 @@
 # Telegram-бот для 3x-ui
 
-Бот регистрирует клиентов в панели [3x-ui](https://github.com/MHSanaei/3x-ui), хранит заявки в SQLite и выдаёт ссылки подписки.
+Бот регистрирует клиентов в [3x-ui](https://github.com/MHSanaei/3x-ui) **3.2+** (мастер-панель + ноды), хранит заявки в SQLite и выдаёт **одну ссылку мультиподписки**.
 
 ## Возможности
 
-- Регистрация во все inbound одной кнопкой.
-- **Несколько VPS / панелей** — бот выдаёт по ссылке подписки на каждый сервер (один UUID/sub_id, два хоста).
-- Подтверждение заявки админом с **выбором срока** (7 / 30 / 90 / 180 / 365 дней).
+- Регистрация через `POST /panel/api/clients/add` (API Token / Bearer).
+- **Мастер + ноды** — бот ходит только на мастер-панель; США и другие VPS подключаются как ноды в UI мастера, клиенты синхронизируются автоматически.
+- **Одна ссылка подписки** — все локации в одном профиле (мультиподписка 3x-ui).
+- Подтверждение заявки админом с выбором срока (7 / 30 / 90 / 180 / 365 дней).
 - Напоминания за 3 дня, 1 день и при окончании подписки.
-- Автоматическое чтение параметров подписки (subURI / subPath) из самой панели — вручную в `.env` их задавать не нужно.
-- Совместимость с **3x-ui 3.x** ([релизы](https://github.com/MHSanaei/3x-ui)): `POST /panel/api/clients/*`, авторизация через **API Token** (`PANEL_API_TOKEN_*`); для панелей 2.x — `PANEL_API_MODE=legacy`.
-- Продление обновляет и единого v3-клиента, и старые записи по inbound (после миграции с 2.x).
+- Автоматическое чтение `subURI` / `subPath` с мастер-панели.
 
-## Несколько серверов
-
-Для каждого VPS задайте блок с суффиксом `_1`, `_2`, … в `.env`:
+## Архитектура (рекомендуется)
 
 ```
-PANEL_NAME_1=Нидерланды
-PANEL_BASE_URL_1=https://host1.example.com/prefix1
-PANEL_LOGIN_1=admin
-PANEL_PASSWORD_1=***
-
-PANEL_NAME_2=Германия
-PANEL_BASE_URL_2=https://host2.example.com/prefix2
-PANEL_LOGIN_2=admin
-PANEL_PASSWORD_2=***
+Telegram-бот  →  API мастер-панели (DE)  →  синхронизация  →  нода (US)
+                      ↓
+              Subscription Server (мультиподписка)
 ```
 
-Бот создаст клиента с одинаковым UUID/sub_id на обеих панелях и отправит пользователю две ссылки — по одной на каждый сервер. Если хоть одна панель недоступна при выдаче — вся операция откатится с ошибкой, чтобы не выдать «половину» доступа. Старые переменные без суффикса (`PANEL_BASE_URL` и т.д.) продолжают работать как один сервер (fallback).
+В `.env` указывается **только мастер** (`PANEL_BASE_URL_1`, `PANEL_API_TOKEN_1`).  
+`PANEL_INBOUND_IDS` — id inbound на мастере, к которым нужно привязать клиента (включая inbound с нод).
 
 ## Быстрый старт
 
 ```bash
 cp .env.example .env
-# отредактируйте .env (как минимум BOT_TOKEN, PANEL_LOGIN, PANEL_PASSWORD, PANEL_BASE_URL, ADMIN_ID)
+# BOT_TOKEN, PANEL_BASE_URL_1, PANEL_API_TOKEN_1, ADMIN_ID, PANEL_INBOUND_IDS
 
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
+
+В панели: **Settings → Security → API Token**, **Settings → Subscription** (включить sub, проверить subURI), **Nodes** — добавить ноду США.
 
 ## Обновление на сервере (systemd)
 
 ```bash
 sudo systemctl stop my_bot.service
-
 cd /etc/vpn/Tgbot
-git pull                              # или scp/rsync: перезаписать файлы
-
+git pull
 source .venv/bin/activate
-pip install -r requirements.txt       # если менялся requirements.txt
-
+pip install -r requirements.txt
 sudo systemctl start my_bot.service
-sudo systemctl status my_bot.service
-sudo journalctl -u my_bot.service -f  # посмотреть логи
+journalctl -u my_bot.service -f
 ```
 
-## Безопасность и публикация на GitHub
+В логах после старта ищите `panel_api build=v3-only-2026-05-29`.
 
-- **Не коммитьте** `.env`, базы `*.db` / `*.sqlite3`, каталог `.venv/` — они в `.gitignore`.
-- В репозитории не должно быть реальных URL панели, токена бота, паролей: только шаблоны в `.env.example`.
-- Если `.env` или секреты когда-либо попали в git: `git rm --cached .env`, смените пароль панели и перевыпустите токен бота у [@BotFather](https://t.me/BotFather).
-- Перед `git push` полезно проверить `git grep -iE 'token|password|AAG[A-Za-z0-9_-]{30,}'`.
+## Безопасность
 
-## API Token (3.x)
-
-В каждой панели: **Settings → Security → API Token** → создайте токен и пропишите в `.env`:
-
-```
-PANEL_API_TOKEN_1=...
-PANEL_API_TOKEN_2=...
-```
-
-Логин/пароль можно оставить как запасной вариант или убрать, если везде задан токен.
+- Не коммитьте `.env` и `*.db`.
+- API Token и `BOT_TOKEN` при утечке — перевыпустить.
 
 ## Частые проблемы
 
-- **Продлился только один протокол (например VLESS)** — старые клиенты были заведены отдельно на каждый inbound; после обновления бота повторите продление из админки — подтянутся все inbound. В логах ищите `Продление legacy` и `привязка ... к inbound`.
-- **`TelegramConflictError`** — запущено два экземпляра с одним `BOT_TOKEN` (часто ещё висит встроенный бот внутри 3x-ui). Остановите лишний процесс.
+- **Клиент создаётся, но в подписке один сервер** — проверьте `PANEL_INBOUND_IDS` (все нужные inbound на мастере) и мультиподписку в Settings → Subscription.
+- **Продление не находит клиента** — после сброса панели старые записи в `bot.db` не совпадают с панелью; выдайте доступ заново.
 - **404 при логине** — в `PANEL_BASE_URL` не должно быть `/panel/` на конце.
-- **Ссылка подписки «не та»** — проверьте в панели раздел «Subscription»; бот автоматически подхватит оттуда `subURI`/`subPath`. Можно переопределить `SUBSCRIPTION_BASE_URL` и `SUBSCRIPTION_PATH` в `.env`.
+- **`TelegramConflictError`** — два процесса с одним `BOT_TOKEN` (часто встроенный бот 3x-ui).
+
+Документация API: OpenAPI в панели 3x-ui 3.x, репозиторий [MHSanaei/3x-ui](https://github.com/MHSanaei/3x-ui).
