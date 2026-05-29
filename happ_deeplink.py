@@ -1,11 +1,11 @@
-"""Ссылка Happ для импорта подписки: https://happ.su/config#<Base64 URL-safe>
+"""Deep link Happ: happ://add/<url_подписки>#<имя_профиля>
 
+Стандартный импорт подписки на iOS и Android.
 Документация: https://www.happ.su/main/faq/adding-configuration-subscription
 """
 
 from __future__ import annotations
 
-import base64
 import os
 from urllib.parse import quote
 
@@ -15,22 +15,13 @@ def happ_deeplink_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
-def _encode_subscription_payload(subscription_url: str) -> str:
-    mode = os.getenv("HAPP_LINK_ENCODE", "base64").strip().lower()
-    if mode in ("url", "encode", "percent", "uri"):
-        return quote(subscription_url, safe="")
-    raw = base64.urlsafe_b64encode(subscription_url.encode("utf-8")).decode("ascii")
-    return raw.rstrip("=")
-
-
-def build_happ_config_url(subscription_url: str, profile_name: str = "") -> str | None:
-    """https://happ.su/config#… — в тексте сообщения или по нажатию в чате."""
-    _ = profile_name
+def build_happ_deeplink(subscription_url: str, profile_name: str = "") -> str | None:
+    """happ://add/… — для синей ссылки «Открыть в Happ» в сообщении."""
     sub = subscription_url.strip()
     if not sub or not happ_deeplink_enabled():
         return None
-    base = os.getenv("HAPP_CONFIG_URL", "https://happ.su/config").strip().rstrip("/")
-    if not base:
-        return None
-    encoded = _encode_subscription_payload(sub)
-    return f"{base}#{encoded}"
+    deeplink = f"happ://add/{sub}"
+    name = (profile_name or "").strip()
+    if name:
+        deeplink += f"#{quote(name, safe='')}"
+    return deeplink

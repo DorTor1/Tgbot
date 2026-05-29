@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 import bot_ui as ui
 import db
-from happ_deeplink import build_happ_config_url, happ_deeplink_enabled
+from happ_deeplink import build_happ_deeplink, happ_deeplink_enabled
 from panel_api import (
     PANEL_API_BUILD,
     PanelAPI,
@@ -260,13 +260,13 @@ def _happ_link_lines(
         return []
     out: list[str] = []
     if len(links) == 1:
-        happ_url = build_happ_config_url(links[0][1], device_label)
+        happ_url = build_happ_deeplink(links[0][1], device_label)
         if happ_url:
             out.append(ui.happ_link_html(happ_url))
         return out
     for name, link in links:
         profile = f"{device_label} — {name}" if device_label else name
-        happ_url = build_happ_config_url(link, profile)
+        happ_url = build_happ_deeplink(link, profile)
         if happ_url:
             out.append("")
             out.append(ui.happ_link_html(happ_url, server_name=name))
