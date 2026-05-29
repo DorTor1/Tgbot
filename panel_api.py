@@ -192,6 +192,15 @@ class PanelAPI:
             return {}
         return {self._CSRF_HEADER: self._csrf_token}
 
+    def _session_headers(self) -> dict[str, str]:
+        """Заголовки cookie-сессии (логин). Bearer сюда не добавляем."""
+        h: dict[str, str] = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json",
+        }
+        h.update(self._csrf_headers())
+        return h
+
     async def _fetch_public_csrf_token(self) -> None:
         client = self._require_client()
         url = self._abs_url("csrf-token")
@@ -256,34 +265,49 @@ class PanelAPI:
         return self._client
 
     async def login(self) -> None:
+        """Cookie-сессия для /panel/setting/* (если нет API-токена или Bearer не подходит)."""
         client = self._require_client()
         await self._fetch_public_csrf_token()
-        login_url = self._abs_url("login")
         login_body = {
             "username": self._username,
             "password": self._password,
             "twoFactorCode": "",
         }
-        try:
-            r = await client.post(
-                login_url,
-                json=login_body,
-                headers=self._api_headers(),
-            )
-            if r.status_code == 400:
-                r = await client.post(
+        r: httpx.Response | None = None
+        last_status = 0
+        for path in ("login", "panel/login"):
+            login_url = self._abs_url(path)
+            try:
+                candidate = await client.post(
                     login_url,
-                    data={
-                        "username": self._username,
-                        "password": self._password,
-                    },
-                    headers=self._api_headers(),
+                    json=login_body,
+                    headers=self._session_headers(),
                 )
-        except httpx.RequestError as e:
-            logger.exception("Панель недоступна при логине: %s", e)
-            raise PanelAPIError("Панель недоступна. Попробуйте позже.") from e
+                if candidate.status_code == 400:
+                    candidate = await client.post(
+                        login_url,
+                        data={
+                            "username": self._username,
+                            "password": self._password,
+                        },
+                        headers=self._session_headers(),
+                    )
+            except httpx.RequestError as e:
+                logger.exception("Панель недоступна при логине %s: %s", path, e)
+                raise PanelAPIError("Панель недоступна. Попробуйте позже.") from e
+            last_status = candidate.status_code
+            logger.info("POST /%s status=%s", path, candidate.status_code)
+            if candidate.status_code == 404:
+                continue
+            r = candidate
+            break
 
-        logger.info("POST /login status=%s", r.status_code)
+        if r is None:
+            raise PanelAPIError(
+                "Эндпоинт /login недоступен (HTTP 404). "
+                "Задайте PANEL_API_TOKEN в .env — для API логин/пароль не нужны."
+            )
+
         if r.status_code == 403:
             logger.warning("Логин 403 (часто CSRF). Ответ: %s", r.text[:500])
             raise PanelAPIError(
@@ -291,7 +315,10 @@ class PanelAPI:
             )
         if r.status_code != 200:
             logger.warning("Ответ логина: %s", r.text[:500])
-            raise PanelAPIError("Не удалось войти в панель (проверьте логин/пароль).")
+            raise PanelAPIError(
+                f"Не удалось войти в панель (HTTP {r.status_code}). "
+                "Проверьте логин/пароль или используйте PANEL_API_TOKEN."
+            )
 
         try:
             body = r.json()
@@ -302,7 +329,7 @@ class PanelAPI:
         if not body.get("success", True):
             msg = body.get("msg", "unknown")
             logger.error("Логин отклонён: %s", msg)
-            raise PanelAPIError("Вход в панель отклонён.")
+            raise PanelAPIError(f"Вход в панель отклонён: {msg}")
 
         await self._fetch_panel_csrf_token()
         self._logged_in = True
@@ -367,10 +394,8 @@ class PanelAPI:
             raise PanelAPIError(f"{op_name}: {msg}{suffix}")
 
     async def _auth_for_setting_routes(self) -> None:
-        """POST /panel/setting/* в 3x-ui принимает cookie-сессию, не Bearer."""
-        if self._uses_bearer() and self._username and self._password:
-            if not self._logged_in:
-                await self.login()
+        """Настройки подписки: Bearer или cookie-сессия (без принудительного login при токене)."""
+        if self._uses_bearer():
             return
         await self._ensure_auth()
 
@@ -390,6 +415,13 @@ class PanelAPI:
             r = candidate
             break
         if r is None:
+            if self._uses_bearer():
+                logger.info(
+                    "setting/all недоступен (HTTP %s); ссылки подписки соберутся из "
+                    "PANEL_BASE_URL или SUBSCRIPTION_* в .env",
+                    last_status,
+                )
+                return {}
             raise PanelAPIError(
                 f"setting/all: не удалось получить настройки (HTTP {last_status})."
             )
