@@ -47,6 +47,7 @@ def _load_panel_helpers_from_main():
         "subscription_text": main._subscription_message_text,
         "subscription_keyboard": main._subscription_reply_keyboard,
         "notify_admins_payment": main._notify_admins_new_payment,
+        "group_size": main.GROUP_SIZE,
     }
 
 
@@ -69,7 +70,7 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
     await db.mark_payment_paid(payment_record.yookassa_payment_id)
 
     if is_renewal:
-        # Продление: продлеваем всю десятку
+        # Продление: продлеваем всю десятку, привязывая срок к lead'у
         global_slot = await db.get_user_global_slot_index(
             tid, payment_record.device_kind, payment_record.slot_index
         )
@@ -81,27 +82,50 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
                 payment_record.slot_index,
             )
         else:
+            from datetime import datetime, timezone
+
             group_devices = await db.list_user_devices_in_group(tid, global_slot)
             extend = helpers.get("extend_subscription")
             if extend is None:
                 logger.error("Webhook: helpers.extend_subscription не зарегистрирован")
             else:
+                # Находим lead'а в группе (global_slot может быть любым,
+                # lead = ((global_slot-1)//group_size)*group_size + 1)
+                group_size = helpers.get("group_size", 10)
+                lead_global = ((global_slot - 1) // group_size) * group_size + 1
+                lead_dev = await db.get_user_device_by_global_slot(tid, lead_global)
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                if (
+                    lead_dev
+                    and lead_dev.expiry_time_ms
+                    and lead_dev.expiry_time_ms > now_ms
+                ):
+                    # Lead ещё активен — продлеваем от его expiry
+                    target_expiry_ms = (
+                        lead_dev.expiry_time_ms + days * 24 * 60 * 60 * 1000
+                    )
+                else:
+                    # Lead истёк или его нет — продлеваем от сегодня
+                    target_expiry_ms = now_ms + days * 24 * 60 * 60 * 1000
+
                 renewed_count = 0
                 for dev in group_devices:
                     ok, _, _ = await extend(
                         tid=tid,
                         device_kind=dev.device_kind,
                         slot_index=dev.slot_index,
-                        days=days,
+                        target_expiry_ms=target_expiry_ms,
                     )
                     if ok:
                         renewed_count += 1
                 logger.info(
-                    "Webhook: продлено %d/%d устройств в группе lead=%d для tid=%s",
+                    "Webhook: продлено %d/%d устройств в группе lead=%d для tid=%s "
+                    "до %s",
                     renewed_count,
                     len(group_devices),
-                    global_slot,
+                    lead_global,
                     tid,
+                    target_expiry_ms,
                 )
         try:
             label = helpers["device_label"](
@@ -109,7 +133,7 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
             )
             await bot.send_message(
                 tid,
-                f"✅ Оплата получена! Продлены все устройства в группе "
+                f"✅ Оплата получена! Все устройства группы продлены до одной даты "
                 f"(включая «{label}»).",
             )
         except Exception:

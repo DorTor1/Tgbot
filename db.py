@@ -294,6 +294,16 @@ async def get_user_global_slot_index(
     return int(row[0]) if row else None
 
 
+async def get_user_device_by_global_slot(
+    telegram_id: int, global_slot: int
+) -> UserDeviceRecord | None:
+    """Возвращает user_device пользователя по его глобальному номеру слота."""
+    all_devices = await list_user_devices(telegram_id)
+    if not all_devices or global_slot < 1 or global_slot > len(all_devices):
+        return None
+    return all_devices[global_slot - 1]
+
+
 async def list_user_devices_in_group(
     telegram_id: int, lead_global_slot: int
 ) -> list[UserDeviceRecord]:
