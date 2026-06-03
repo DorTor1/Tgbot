@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -145,7 +146,7 @@ def create_payment(
 
     _sdk()
     if not idempotence_key:
-        idempotence_key = f"tg-{telegram_id}-{device_kind}-{slot_index}-{days}"
+        idempotence_key = f"tg-{telegram_id}-{device_kind}-{slot_index}-{days}-{uuid.uuid4().hex[:8]}"
 
     description = f"Подписка Vibecode VPN на {days} дней"
     return_url = get_return_url()

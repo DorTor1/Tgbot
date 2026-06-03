@@ -2,7 +2,6 @@
 
 import aiosqlite
 import logging
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -738,8 +737,7 @@ async def try_create_payment(
     confirmation_url: str | None,
 ) -> PaymentRecord | None:
     """Создаёт запись о платеже. Если у пользователя уже есть pending —
-    возвращает None (без записи). Если yookassa_payment_id уже есть в БД
-    (status не pending) — возвращает ту старую запись.
+    возвращает None (без записи).
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -752,33 +750,24 @@ async def try_create_payment(
         )
         if await cur.fetchone():
             return None
-        try:
-            cur = await db.execute(
-                """
-                INSERT INTO payments (
-                    telegram_id, username, first_name, last_name, kind,
-                    device_kind, slot_index, base_email,
-                    plan_days, amount, yookassa_payment_id, confirmation_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_id, username, first_name, last_name, kind,
-                    device_kind, slot_index, base_email,
-                    plan_days, amount, yookassa_payment_id, confirmation_url,
-                ),
-            )
-            new_id = cur.lastrowid
-            await db.commit()
-        except sqlite3.IntegrityError:
-            await db.rollback()
-            cur = await db.execute(
-                "SELECT * FROM payments WHERE yookassa_payment_id = ?",
-                (yookassa_payment_id,),
-            )
-            row = await cur.fetchone()
-            return _row_to_payment(row) if row else None
+        cur = await db.execute(
+            """
+            INSERT INTO payments (
+                telegram_id, username, first_name, last_name, kind,
+                device_kind, slot_index, base_email,
+                plan_days, amount, yookassa_payment_id, confirmation_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id, username, first_name, last_name, kind,
+                device_kind, slot_index, base_email,
+                plan_days, amount, yookassa_payment_id, confirmation_url,
+            ),
+        )
+        new_id = cur.lastrowid
         cur = await db.execute("SELECT * FROM payments WHERE id = ?", (new_id,))
         row = await cur.fetchone()
+        await db.commit()
     return _row_to_payment(row)
 
 
