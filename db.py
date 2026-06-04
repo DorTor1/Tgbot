@@ -294,12 +294,14 @@ async def get_user_device_by_global_slot(
 
 
 async def list_user_devices_in_group(
-    telegram_id: int, lead_global_slot: int
+    telegram_id: int, lead_global_slot: int, group_size: int = 10
 ) -> list[UserDeviceRecord]:
-    """Все user_devices пользователя, чей глобальный слот в одной десятке
-    с lead_global_slot. Например, для lead=1 вернёт слоты 1..10."""
+    """Все user_devices пользователя, чей глобальный слот в одной группе
+    с lead_global_slot. Размер группы — group_size (по умолчанию 10),
+    должен совпадать с GROUP_SIZE из main.py, иначе группы «протекают»
+    в соседние. Например, для lead=1, group_size=10 вернёт слоты 1..10."""
     group_start = lead_global_slot
-    group_end = lead_global_slot + 9
+    group_end = lead_global_slot + group_size - 1
     all_devices = await list_user_devices(telegram_id)
     if not all_devices:
         return []

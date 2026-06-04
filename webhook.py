@@ -96,7 +96,9 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
         else:
             # Сначала определяем lead'а, потом берём устройства его группы
             lead_global = ((global_slot - 1) // group_size) * group_size + 1
-            group_devices = await db.list_user_devices_in_group(tid, lead_global)
+            group_devices = await db.list_user_devices_in_group(
+                tid, lead_global, group_size
+            )
             total_in_group = len(group_devices)
             lead_dev = await db.get_user_device_by_global_slot(tid, lead_global)
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
