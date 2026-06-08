@@ -6,13 +6,23 @@
 
 При payment.succeeded — создаём клиента в 3x-ui и отправляем пользователю ссылку.
 При payment.canceled — уведомляем пользователя, что оплата не прошла.
+
+C4+C5: безопасность webhook'а — IP-фильтр (whitelist ЮKassa) + HMAC-SHA256
+проверка подписи тела через Content-Signature. Оба фильтра независимы —
+если любой отказывает, запрос отклоняется. Kill-switch через
+YOOKASSA_REQUIRE_SIGNATURE=0 в .env (для аварийного отключения проверок).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import ipaddress
+import json
 import logging
 import os
+import signal
 from typing import Any
 
 from aiohttp import web
@@ -27,6 +37,145 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
+# C5: IP-адреса, с которых ЮKassa шлёт webhook'и.
+# Источник: https://yookassa.ru/developers/using-api/webhooks
+# (актуальный список — на момент реализации; перепроверять при изменениях в доке).
+YOOKASSA_IP_RANGES_RAW: tuple[str, ...] = (
+    "185.71.76.0/27",
+    "185.71.77.0/27",
+    "77.75.153.0/25",
+    "77.75.154.128/25",
+    "77.75.156.11/32",
+    "77.75.156.35/32",
+    "2a02:5180::/32",
+)
+YOOKASSA_IP_NETWORKS: tuple[Any, ...] = tuple(
+    ipaddress.ip_network(c) for c in YOOKASSA_IP_RANGES_RAW
+)
+
+
+def _signature_required() -> bool:
+    """Kill-switch: True = проверять подпись + IP, False = пропускать всё."""
+    return os.getenv("YOOKASSA_REQUIRE_SIGNATURE", "0").strip() == "1"
+
+
+def _trust_proxy() -> bool:
+    """True = читать реальный IP из X-Forwarded-For (стоит за nginx)."""
+    return os.getenv("YOOKASSA_TRUST_PROXY", "0").strip() == "1"
+
+
+def parse_content_signature_header(raw: str | None) -> str | None:
+    """Парсит заголовок Content-Signature.
+
+    ЮKassa шлёт в формате `value=<hex>` (см. официальную доку).
+    Для совместимости принимаем и "голый" hex.
+    Возвращает чистый hex (lowercase) или None, если заголовок пустой.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("value="):
+        raw = raw[6:].strip()
+    return raw or None
+
+
+def verify_yookassa_signature(
+    body: bytes, header_value: str | None, secret: str
+) -> bool:
+    """Проверяет HMAC-SHA256 подпись тела webhook'а.
+
+    ЮKassa подписывает сырое тело запроса (до JSON-парсинга) твоим
+    YOOKASSA_SECRET_KEY. Подпись приходит в Content-Signature.
+    Безопасное сравнение через hmac.compare_digest.
+    """
+    if not secret or not header_value:
+        return False
+    hex_sig = parse_content_signature_header(header_value)
+    if not hex_sig:
+        return False
+    expected = hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(hex_sig.lower(), expected.lower())
+
+
+def ip_allowed(
+    remote: str,
+    trust_proxy: bool,
+    x_forwarded_for: str | None,
+    networks: tuple[Any, ...],
+) -> bool:
+    """True, если remote (или первый IP из X-Forwarded-For при trust_proxy)
+    входит в whitelist networks.
+    """
+    candidate = (remote or "").strip()
+    if trust_proxy and x_forwarded_for:
+        first = x_forwarded_for.split(",", 1)[0].strip()
+        if first:
+            candidate = first
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return any(ip in net for net in networks)
+
+
+@web.middleware
+async def yookassa_security_middleware(
+    request: web.Request, handler: Any
+) -> web.StreamResponse:
+    """C4+C5: IP-фильтр + HMAC-проверка подписи для /yookassa/notify.
+
+    Проверки работают только если YOOKASSA_REQUIRE_SIGNATURE=1 (kill-switch).
+    На других путях (например /health) middleware пропускает без проверок.
+    Body читается в middleware, кладётся в request._body_for_handler —
+    handler не должен вызывать request.json()/request.read() повторно.
+    """
+    if request.path != "/yookassa/notify":
+        return await handler(request)
+
+    if not _signature_required():
+        return await handler(request)
+
+    # 1. IP-фильтр
+    if not ip_allowed(
+        remote=request.remote or "",
+        trust_proxy=_trust_proxy(),
+        x_forwarded_for=request.headers.get("X-Forwarded-For"),
+        networks=YOOKASSA_IP_NETWORKS,
+    ):
+        logger.warning(
+            "Webhook: отклонён по IP remote=%s xff=%s",
+            request.remote,
+            request.headers.get("X-Forwarded-For"),
+        )
+        return web.Response(status=403, text="forbidden ip")
+
+    # 2. Подпись
+    body = await request.read()
+    secret = os.getenv("YOOKASSA_SECRET_KEY", "").strip()
+    if not secret:
+        logger.error(
+            "Webhook: YOOKASSA_REQUIRE_SIGNATURE=1, но YOOKASSA_SECRET_KEY пуст — "
+            "проверка подписи невозможна. Задайте ключ в .env или выключите kill-switch."
+        )
+        return web.Response(status=500, text="signature misconfigured")
+
+    if not verify_yookassa_signature(
+        body, request.headers.get("Content-Signature"), secret
+    ):
+        logger.warning(
+            "Webhook: неверная подпись remote=%s",
+            request.remote,
+        )
+        return web.Response(status=401, text="bad signature")
+
+    request._body_for_handler = body
+    return await handler(request)
 
 
 def _load_panel_helpers_from_main():
@@ -66,8 +215,14 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
     tid = payment_record.telegram_id
     is_renewal = payment_record.kind == "renewal"
 
-    # Помечаем оплату в БД
-    await db.mark_payment_paid(payment_record.yookassa_payment_id)
+    # Помечаем оплату в БД. rowcount==0 → другой webhook уже обработал (N2 race).
+    updated = await db.mark_payment_paid(payment_record.yookassa_payment_id)
+    if updated == 0:
+        logger.info(
+            "Webhook: payment %s уже обработан (rowcount=0), пропускаем",
+            payment_record.yookassa_payment_id,
+        )
+        return
 
     if is_renewal:
         # Продление: продлеваем всю десятку, привязывая срок к lead'у
@@ -267,7 +422,13 @@ async def _process_succeeded(payment_record: db.PaymentRecord, bot) -> None:
 
 
 async def _process_canceled(payment_record: db.PaymentRecord, bot) -> None:
-    await db.mark_payment_canceled(payment_record.yookassa_payment_id)
+    updated = await db.mark_payment_canceled(payment_record.yookassa_payment_id)
+    if updated == 0:
+        logger.info(
+            "Webhook: payment %s уже не pending, пропускаем",
+            payment_record.yookassa_payment_id,
+        )
+        return
     try:
         if payment_record.kind == "renewal":
             await bot.send_message(payment_record.telegram_id, PAYMENT_CANCELED)
@@ -281,15 +442,27 @@ async def _process_canceled(payment_record: db.PaymentRecord, bot) -> None:
 
 
 async def _handle_notify(request: web.Request) -> web.Response:
-    """POST /yookassa/notify — сюда стучится ЮKassa."""
+    """POST /yookassa/notify — сюда стучится ЮKassa.
+
+    C4: если включён kill-switch — body прочитан в middleware и лежит в
+    request._body_for_handler. Иначе читаем сами (старое поведение).
+    """
+    body = getattr(request, "_body_for_handler", None)
+    if body is None:
+        try:
+            body = await request.read()
+        except Exception:
+            logger.warning("Webhook: не удалось прочитать тело")
+            return web.Response(status=400, text="bad request")
+
     try:
-        body = await request.json()
+        data = json.loads(body)
     except Exception:
         logger.warning("Webhook: некорректный JSON")
         return web.Response(status=400, text="bad json")
 
-    event = body.get("event")
-    obj = body.get("object") or {}
+    event = data.get("event")
+    obj = data.get("object") or {}
     payment_id = obj.get("id")
     if not event or not payment_id:
         logger.warning("Webhook: пустой event/object: %s", body)
@@ -338,7 +511,7 @@ async def main() -> None:
 
     HELPERS.update(_load_panel_helpers_from_main())
 
-    app = web.Application()
+    app = web.Application(middlewares=[yookassa_security_middleware])
     app["bot"] = bot
     app.router.add_post("/yookassa/notify", _handle_notify)
     app.router.add_get("/health", _handle_health)
@@ -348,8 +521,23 @@ async def main() -> None:
     logger.info("Webhook ЮKassa слушает http://%s:%s/yookassa/notify", host, port)
 
     try:
-        await web._run_app(app, host=host, port=port, print=None)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host=host, port=port)
+        await site.start()
+        logger.info(
+            "Webhook ЮKassa listening on http://%s:%s/yookassa/notify", host, port
+        )
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass
+        await stop_event.wait()
     finally:
+        await runner.cleanup()
         await bot.session.close()
 
 

@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 import bot_ui as ui
 import db
 import payments
+from services import payments_service
 from panel_api import (
     PANEL_API_BUILD,
     PanelAPI,
@@ -41,7 +42,6 @@ from panel_api import (
     panel_client_email,
     subscription_expiry_time_ms,
 )
-from vpn_legal import LEGAL_TEXT
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -422,16 +422,18 @@ def _panels_configured() -> bool:
 
 
 # URL страницы с публичной офертой и политикой конфиденциальности на сайте.
-# Если задан — в боте показывается короткое сообщение со ссылкой.
-# Если пусто — fallback на полный текст LEGAL_TEXT из vpn_legal.py.
+# Обязателен: без него бот не сможет показать пользователю ссылки на документы.
 OFFER_URL = _env("OFFER_URL")
 
 
 def _legal_text() -> str:
-    """Текст согласия: короткая ссылка на сайт, или полный текст из vpn_legal."""
-    if OFFER_URL:
-        return ui.offer_prompt(OFFER_URL)
-    return LEGAL_TEXT
+    """Текст согласия: короткое сообщение со ссылкой на оферту на сайте."""
+    if not OFFER_URL:
+        raise RuntimeError(
+            "Задайте OFFER_URL в .env (URL страницы с офертой и пользовательским "
+            "соглашением)."
+        )
+    return ui.offer_prompt(OFFER_URL)
 
 
 def _greeting_name(user: User | None) -> str:
@@ -445,7 +447,7 @@ def _greeting_name(user: User | None) -> str:
 
 
 def _welcome_text(user: User | None) -> str:
-    return ui.welcome(_greeting_name(user), approval=True)
+    return ui.welcome(ui.e(_greeting_name(user)), approval=True)
 
 
 def _main_keyboard() -> InlineKeyboardMarkup:
@@ -530,9 +532,9 @@ def _agreement_inline_keyboard() -> InlineKeyboardMarkup:
 def _format_payment_who(record: db.PaymentRecord) -> str:
     parts: list[str] = []
     if record.username:
-        parts.append(f"@{record.username}")
+        parts.append(f"@{ui.e(record.username)}")
     name = " ".join(
-        x for x in (record.first_name or "", record.last_name or "") if x
+        ui.e(x) for x in (record.first_name or "", record.last_name or "") if x
     ).strip()
     if name:
         parts.append(name)
@@ -555,6 +557,24 @@ async def _notify_admins_new_payment(bot: Bot, record: db.PaymentRecord) -> None
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             logger.exception("Не удалось уведомить админа %s о платеже", admin_id)
+
+
+# C2: per-slot lock, чтобы в окне между create_pending и attach
+# параллельный callback не сходил второй раз в ЮKassa.
+_payment_creation_locks: dict[tuple[int, str, int], asyncio.Lock] = {}
+_payment_creation_locks_guard = asyncio.Lock()
+
+
+async def _get_payment_creation_lock(
+    tid: int, kind: str, slot_index: int
+) -> asyncio.Lock:
+    key = (tid, kind, slot_index)
+    async with _payment_creation_locks_guard:
+        lock = _payment_creation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _payment_creation_locks[key] = lock
+        return lock
 
 
 async def _create_subscription_for_user(
@@ -720,6 +740,12 @@ async def _expire_old_payments_worker(bot: Bot) -> None:
     Если юзер создал счёт и ушёл (не нажал «Отменить» и не оплатил),
     через PAYMENT_EXPIRES_SECONDS переводим запись в canceled,
     чтобы она не блокировала get_active_payment().
+
+    C2: после SELECT expire_old_pending_payments возвращает все «старые»
+    pending, но UPDATE мог пропустить часть из них (если параллельный
+    webhook уже поставил succeeded). Поэтому перед каждым действием
+    в ЮKassa/уведомлением перечитываем актуальный статус и реагируем
+    только если он по-прежнему canceled.
     """
     check_interval = 60
     while True:
@@ -728,17 +754,29 @@ async def _expire_old_payments_worker(bot: Bot) -> None:
                 payments.PAYMENT_EXPIRES_SECONDS
             )
             for rec in expired:
-                # Гасим счёт и на стороне ЮKassa, чтобы по старой ссылке
-                # нельзя было заплатить уже после авто-отмены в БД.
-                try:
-                    await asyncio.to_thread(
-                        payments.cancel_payment, rec.yookassa_payment_id
+                # rec.yookassa_payment_id может быть None, если ЮKassa
+                # не ответила на этапе 2 (см. _create_payment_for_user) —
+                # тогда и в ЮKassa отменять нечего, юзеру просто скажем
+                # «счёт истёк».
+                current = None
+                if rec.yookassa_payment_id:
+                    current = await db.get_payment_by_yookassa_id(
+                        rec.yookassa_payment_id
                     )
-                except Exception:
-                    logger.exception(
-                        "Не удалось отменить счёт %s в ЮKassa",
-                        rec.yookassa_payment_id,
-                    )
+                effective_status = current.status if current else rec.status
+                if effective_status != "canceled":
+                    # Webhook успел раньше воркера — ничего не делаем.
+                    continue
+                if rec.yookassa_payment_id:
+                    try:
+                        await asyncio.to_thread(
+                            payments.cancel_payment, rec.yookassa_payment_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Не удалось отменить счёт %s в ЮKassa",
+                            rec.yookassa_payment_id,
+                        )
                 try:
                     await bot.send_message(
                         rec.telegram_id,
@@ -1007,7 +1045,7 @@ async def admin_list_users(message: Message) -> None:
 
         user_display = f"<code>{u['tid']}</code>"
         if u["username"]:
-            user_display = f"@{u['username']} ({user_display})"
+            user_display = f"@{ui.e(u['username'])} ({user_display})"
 
         line = f"• {user_display}: {status} {devices}"
         lines.append(line)
@@ -1101,7 +1139,7 @@ async def admin_send_to_user(message: Message, bot: Bot) -> None:
         await message.answer(
             f"Не удалось отправить пользователю <code>{target_tid}</code>.\n"
             f"Частые причины: пользователь не нажимал /start, заблокировал бота, неверный ID.\n"
-            f"Технически: {e!s}"[:3500],
+            f"Технически: {ui.e(str(e))}"[:3500],
             parse_mode="HTML",
         )
         return
@@ -1549,51 +1587,86 @@ async def _create_payment_for_user(
     slot_index: int,
     base_email: str,
 ) -> tuple[db.PaymentRecord | None, str | None]:
-    """Создаёт платёж в ЮKassa и запись в БД. Возвращает (record, error_text)."""
+    """Создаёт платёж в ЮKassa и запись в БД. Возвращает (record, error_text).
+
+    C2: трёхшаговый flow вместо двух — сначала резервируем pending в БД
+    по уникальному idempotence_key, потом дёргаем ЮKassa, потом привязываем
+    payment_id. Плюс in-memory asyncio.Lock на слот пользователя, чтобы
+    параллельный callback (двойной клик) не уехал в ЮKassa в окне между
+    шагами 1 и 3. Это гарантирует, что останется ровно один pending и
+    один счёт в ЮKassa, а не «висящий» второй счёт.
+    """
     if not payments.is_configured():
         return None, "Оплата временно недоступна (ЮKassa не настроена)."
 
-    # Не больше одного pending на пользователя
-    existing = await db.get_active_payment(query_from_user.id)
-    if existing is not None:
-        return None, ui.ERR_REQUEST_ALREADY
-
+    tid = query_from_user.id
     try:
         amount = payments.plan_amount(days)
     except ValueError as e:
         return None, f"Тариф недоступен: {e}"
 
-    try:
-        yookassa = payments.create_payment(
-            days=days,
-            amount_rub=amount,
-            telegram_id=query_from_user.id,
+    # C2: per-slot lock, чтобы исключить окно между create_pending и attach.
+    lock = await _get_payment_creation_lock(tid, device_kind, slot_index)
+    async with lock:
+        # 1. Создаём pending с уникальным ключом (атомарно).
+        idempotence_key = (
+            f"tg-{tid}-{device_kind}-{slot_index}-{uuid.uuid4().hex}"
+        )
+        record = await db.create_pending_payment_with_key(
+            idempotence_key=idempotence_key,
+            telegram_id=tid,
+            username=query_from_user.username,
+            first_name=query_from_user.first_name,
+            last_name=query_from_user.last_name,
+            kind=kind,
             device_kind=device_kind,
             slot_index=slot_index,
+            base_email=base_email,
+            plan_days=days,
+            amount=amount,
         )
-    except Exception as e:
-        logger.exception("Не удалось создать платёж в ЮKassa: %s", e)
-        return None, "Не удалось создать счёт. Попробуйте позже."
+        if record is None:
+            return None, ui.ERR_REQUEST_ALREADY
+        if record.yookassa_payment_id is not None:
+            # Уже создан ранее (другой параллельный запрос с тем же ключом
+            # успел дойти до шага 3) — отдать готовый счёт.
+            return record, None
 
-    record = await db.try_create_payment(
-        telegram_id=query_from_user.id,
-        username=query_from_user.username,
-        first_name=query_from_user.first_name,
-        last_name=query_from_user.last_name,
-        kind=kind,
-        device_kind=device_kind,
-        slot_index=slot_index,
-        base_email=base_email,
-        plan_days=days,
-        amount=amount,
-        yookassa_payment_id=yookassa["id"],
-        confirmation_url=yookassa.get("confirmation_url"),
-    )
-    if record is None:
-        # Уже был pending
-        return None, ui.ERR_REQUEST_ALREADY
+        # 2. Создаём счёт в ЮKassa (async, не блокирует event loop).
+        try:
+            yookassa = await payments_service.create_payment_async(
+                days=days,
+                amount_rub=amount,
+                telegram_id=tid,
+                device_kind=device_kind,
+                slot_index=slot_index,
+            )
+        except Exception as e:
+            # Провалились — pending-запись в БД остаётся, через 30 минут её
+            # подберёт expire_old_pending_payments и погасит. Это OK.
+            logger.exception("Не удалось создать платёж в ЮKassa: %s", e)
+            return None, "Не удалось создать счёт. Попробуйте позже."
 
-    # Уведомляем админов (информативно)
+        # 3. Привязываем yookassa_payment_id к нашей pending-записи.
+        ok = await db.attach_yookassa_to_pending(
+            idempotence_key=idempotence_key,
+            yookassa_payment_id=yookassa["id"],
+            confirmation_url=yookassa.get("confirmation_url"),
+        )
+        if not ok:
+            # Параллельно либо webhook уже пометил succeeded, либо в БД пропала
+            # запись (маловероятно). Не плодим дубль — отдадим то, что есть.
+            existing = await db.get_payment_by_idempotence_key(idempotence_key)
+            if existing is not None and existing.yookassa_payment_id is not None:
+                return existing, None
+            return None, ui.ERR_REQUEST_ALREADY
+
+        record = await db.get_payment_by_idempotence_key(idempotence_key)
+        if record is None:
+            return None, ui.ERR_REQUEST_ALREADY
+
+    # Уведомляем админов (информативно) — ВНЕ lock, чтобы не задерживать
+    # других пользователей, если Telegram API тормозит.
     with suppress(Exception):
         await _notify_admins_new_payment(bot, record)
 
@@ -1920,7 +1993,7 @@ async def cb_pay_check(query: CallbackQuery) -> None:
         await query.answer(ui.PAYMENT_EXPIRED, show_alert=True)
         return
     try:
-        info = payments.get_payment_status(payment_id)
+        info = await payments_service.get_payment_status_async(payment_id)
     except Exception:
         await query.answer("Не удалось проверить. Попробуйте позже.", show_alert=True)
         return
@@ -1949,7 +2022,7 @@ async def cb_pay_cancel(query: CallbackQuery) -> None:
     if record.status != "pending":
         await query.answer("Счёт уже не активен.", show_alert=True)
         return
-    payments.cancel_payment(payment_id)
+    await payments_service.cancel_payment_async(payment_id)
     await db.mark_payment_canceled(payment_id)
     await query.answer(ui.PAYMENT_CANCELED, show_alert=True)
     if query.message:

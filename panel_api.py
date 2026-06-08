@@ -379,12 +379,10 @@ class PanelAPI:
         self, r: httpx.Response, op_name: str, detail: str = ""
     ) -> None:
         suffix = f" ({detail})" if detail else ""
-        logger.info(
-            "%s status=%s body=%s",
-            op_name,
-            r.status_code,
-            (r.text[:400] + "…") if len(r.text) > 400 else r.text,
-        )
+        # N3: тело ответа содержит credentials (client.password, client.id, subId).
+        # В INFO логируем только статус; тело — только в DEBUG.
+        logger.info("%s status=%s", op_name, r.status_code)
+        logger.debug("%s body=%s", op_name, r.text[:400])
         if r.status_code != 200:
             raise PanelAPIError(f"{op_name}: HTTP {r.status_code}{suffix}.")
         try:

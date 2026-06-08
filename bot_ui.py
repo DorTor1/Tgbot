@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+import html
+
+
+def e(s: str | None) -> str:
+    """Escape для Telegram HTML-режима (без кавычек).
+
+    Использовать для ЛЮБЫХ пользовательских данных:
+    first_name, last_name, username, target_tid и т.д.
+    перед вставкой в строку с parse_mode='HTML'.
+    """
+    if s is None:
+        return ""
+    return html.escape(str(s), quote=False)
+
 
 SUBSCRIPTION_HOWTO = """📲 <b>Как подключиться</b>
 
@@ -52,14 +66,6 @@ def device_selection(*, approval: bool) -> str:
 
 def plan_selection() -> str:
     return "📅 <b>Выберите срок подписки:</b>\n\n"
-
-
-def plan_prices(prices: dict[int, int]) -> str:
-    """Краткая сводка цен для подтверждения после выбора устройства."""
-    lines = ["<b>Ваш заказ:</b>"]
-    for days, amount in sorted(prices.items()):
-        lines.append(f"• {days} дней — <b>{amount} ₽</b>")
-    return "\n".join(lines)
 
 
 def subscription_header(device_label: str, expiry: str) -> str:

@@ -24,3 +24,7 @@ node_modules/
 .vscode/
 *.log
 backups/
+AGENT_PROMPT.md
+PLAN.md
+STATUS.md
+WORKFLOW.md

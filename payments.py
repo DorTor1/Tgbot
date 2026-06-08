@@ -1,4 +1,4 @@
-"""Обёртка над ЮKassa: создание платежа, проверка статуса, refund.
+"""Обёртка над ЮKassa: создание платежа, проверка статуса, отмена.
 
 Зависимости: yookassa (pip install yookassa)
 """
@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -24,12 +23,6 @@ TERMINAL_STATUSES = {SUCCEEDED, CANCELED}
 
 # Срок жизни счёта в ЮKassa (по договору максимум 7 дней, делаем 30 минут для UX)
 PAYMENT_EXPIRES_SECONDS = 30 * 60
-
-
-@dataclass(slots=True)
-class PlanPrice:
-    days: int
-    amount_rub: int  # в рублях, без копеек
 
 
 def _shop_creds() -> tuple[str, str]:
@@ -221,17 +214,3 @@ def cancel_payment(payment_id: str) -> bool:
     except Exception:
         logger.exception("ЮKassa: не удалось отменить платёж %s", payment_id)
         return False
-
-
-def create_refund(payment_id: str, amount_rub: int | None = None) -> str:
-    """Возвращает ID refund'а. Если amount=None — полный возврат."""
-    from yookassa import Refund  # type: ignore
-
-    _sdk()
-    payload: dict[str, Any] = {
-        "payment_id": payment_id,
-    }
-    if amount_rub is not None:
-        payload["amount"] = {"value": f"{amount_rub}.00", "currency": "RUB"}
-    refund = Refund.create(payload)
-    return refund.id
