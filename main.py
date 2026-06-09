@@ -1609,9 +1609,7 @@ async def _create_payment_for_user(
     lock = await _get_payment_creation_lock(tid, device_kind, slot_index)
     async with lock:
         # 1. Создаём pending с уникальным ключом (атомарно).
-        idempotence_key = (
-            f"tg-{tid}-{device_kind}-{slot_index}-{uuid.uuid4().hex}"
-        )
+        idempotence_key = f"tg-{tid}-{device_kind}-{slot_index}-{uuid.uuid4().hex}"
         record = await db.create_pending_payment_with_key(
             idempotence_key=idempotence_key,
             telegram_id=tid,

@@ -104,14 +104,18 @@ class TestVerifySignature(IsolatedAsyncioTestCase):
         secret = "test-secret"
         body = b"original body"
         sig = _make_signature(body, secret)
-        self.assertFalse(verify_yookassa_signature(b"tampered body", f"value={sig}", secret))
+        self.assertFalse(
+            verify_yookassa_signature(b"tampered body", f"value={sig}", secret)
+        )
 
     async def test_bad_secret(self) -> None:
         from webhook import verify_yookassa_signature
 
         body = b"x"
         sig = _make_signature(body, "real-secret")
-        self.assertFalse(verify_yookassa_signature(body, f"value={sig}", "wrong-secret"))
+        self.assertFalse(
+            verify_yookassa_signature(body, f"value={sig}", "wrong-secret")
+        )
 
     async def test_empty_secret(self) -> None:
         from webhook import verify_yookassa_signature
@@ -174,19 +178,13 @@ class TestIpAllowed(unittest.TestCase):
 
     def test_trust_proxy_xff(self) -> None:
         # trust_proxy=True: берём первый IP из XFF, игнорируем remote.
-        self.assertTrue(
-            self._ip("127.0.0.1", True, "185.71.76.5, 10.0.0.1")
-        )
-        self.assertFalse(
-            self._ip("127.0.0.1", True, "8.8.8.8, 10.0.0.1")
-        )
+        self.assertTrue(self._ip("127.0.0.1", True, "185.71.76.5, 10.0.0.1"))
+        self.assertFalse(self._ip("127.0.0.1", True, "8.8.8.8, 10.0.0.1"))
 
     def test_trust_proxy_disabled(self) -> None:
         # trust_proxy=False: игнорируем XFF, берём remote.
         # remote — 127.0.0.1 (nginx на той же машине) — отлуп.
-        self.assertFalse(
-            self._ip("127.0.0.1", False, "185.71.76.5, 10.0.0.1")
-        )
+        self.assertFalse(self._ip("127.0.0.1", False, "185.71.76.5, 10.0.0.1"))
         # remote — IP ЮKassa напрямую (без nginx) — ок.
         self.assertTrue(self._ip("185.71.76.5", False, "8.8.8.8"))
 

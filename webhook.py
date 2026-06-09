@@ -97,9 +97,7 @@ def verify_yookassa_signature(
     hex_sig = parse_content_signature_header(header_value)
     if not hex_sig:
         return False
-    expected = hmac.new(
-        secret.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(hex_sig.lower(), expected.lower())
 
 

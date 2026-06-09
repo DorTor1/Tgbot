@@ -226,12 +226,12 @@ async def _rebuild_payments_table_drop_notnull(conn: aiosqlite.Connection) -> No
     """Пересоздаёт payments, убирая NOT NULL с yookassa_payment_id (нужно для C2).
 
     В SQLite ALTER TABLE ... DROP NOT NULL поддержан с 3.35.0, но проект
-    может крутиться на более старых сборках — поэтому используем безопасный
-    12-шаговый rebuild. Внутри одной транзакции: RENAME → CREATE → COPY → DROP.
-    При ошибке — ROLLBACK и попытка вернуть имя таблицы.
+    может крутиться на более старых сборках — поэтому rebuild:
+    RENAME → CREATE → COPY → DROP. Явный BEGIN/COMMIT не нужен: вызывается
+    из init_db(), который коммитит снаружи (вложенный BEGIN даёт OperationalError).
+    При ошибке — попытка вернуть имя таблицы payments.
     """
     try:
-        await conn.execute("BEGIN")
         await conn.execute("ALTER TABLE payments RENAME TO payments__migrating")
         await conn.execute(
             """
@@ -262,7 +262,7 @@ async def _rebuild_payments_table_drop_notnull(conn: aiosqlite.Connection) -> No
                 id, telegram_id, username, first_name, last_name, kind,
                 device_kind, slot_index, base_email, plan_days, amount,
                 yookassa_payment_id, confirmation_url,
-                status, created_at, updated_at
+                status, created_at, updated_at, idempotence_key
             )
             SELECT
                 id, telegram_id, username, first_name, last_name, kind,
@@ -270,15 +270,14 @@ async def _rebuild_payments_table_drop_notnull(conn: aiosqlite.Connection) -> No
                 yookassa_payment_id, confirmation_url,
                 status,
                 COALESCE(created_at, datetime('now')),
-                COALESCE(updated_at, datetime('now'))
+                COALESCE(updated_at, datetime('now')),
+                idempotence_key
             FROM payments__migrating
             """
         )
         await conn.execute("DROP TABLE payments__migrating")
-        await conn.execute("COMMIT")
         logger.info("Миграция payments: убран NOT NULL с yookassa_payment_id")
     except Exception:
-        await conn.execute("ROLLBACK")
         try:
             cur = await conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='payments__migrating'"

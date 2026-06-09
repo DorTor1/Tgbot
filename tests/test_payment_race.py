@@ -92,6 +92,7 @@ class TestPaymentRace(IsolatedAsyncioTestCase):
         # Подменяем функцию `payments.is_configured` через модуль payments,
         # который импортирован в main.
         import payments
+
         self._original_is_configured = payments.is_configured
         payments.is_configured = lambda: True
         main.payments.is_configured = lambda: True
@@ -103,8 +104,10 @@ class TestPaymentRace(IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         from services import payments_service
+
         payments_service.create_payment_async = self._original_create_async
         import payments
+
         payments.is_configured = self._original_is_configured
         self._tmpdir.cleanup()
 
@@ -139,7 +142,9 @@ class TestPaymentRace(IsolatedAsyncioTestCase):
         # Все 10 вызовов либо получили запись, либо ERR_REQUEST_ALREADY
         # (потому что в этот момент уже есть pending). Но НЕ
         # «Не удалось создать счёт».
-        self.assertTrue(len(records) >= 1, f"ни одна попытка не создала запись: {errors!r}")
+        self.assertTrue(
+            len(records) >= 1, f"ни одна попытка не создала запись: {errors!r}"
+        )
 
         # В БД должна быть ровно 1 запись для этого telegram_id.
         active = await db.get_active_payment(tid)
